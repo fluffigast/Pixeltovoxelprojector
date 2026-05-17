@@ -453,7 +453,7 @@ class UltimateInsectTracker:
         self.voxel_size = 0.01  # Very fine voxels
         self.insect_voxels = np.zeros(self.voxel_dims, dtype=np.float32)
         self.voxel_colors = np.zeros((*self.voxel_dims, 3), dtype=np.float32)
-        self.voxel_decay = 0.91  # Quick decay for dynamic scenes
+        self.voxel_decay = 0.75  # Fast decay — voxels fade in ~10 frames
         
         # Camera parameters
         self.camera_fov = 80  # Wide field of view for outdoor scenes
@@ -640,24 +640,11 @@ class UltimateInsectTracker:
                 else:
                     color = np.array([0.0, 1.0, 0.0])  # Green - normal
                 
-                intensity = track['confidence'] * 2.0
-                
-                # High-resolution voxel update with fine spreading
-                spread_radius = max(1, int(track['confidence'] * 2))
-                for dx in range(-spread_radius, spread_radius + 1):
-                    for dy in range(-spread_radius, spread_radius + 1):
-                        for dz in range(-1, 2):
-                            nvx, nvy, nvz = vx + dx, vy + dy, vz + dz
-                            if (0 <= nvx < self.voxel_dims[0] and 
-                                0 <= nvy < self.voxel_dims[1] and 
-                                0 <= nvz < self.voxel_dims[2]):
-                                
-                                distance = math.sqrt(dx*dx + dy*dy + dz*dz)
-                                falloff = max(0.1, 1.0 / (1.0 + distance * 0.5))
-                                
-                                update_amount = intensity * falloff
-                                self.insect_voxels[nvx, nvy, nvz] += update_amount
-                                self.voxel_colors[nvx, nvy, nvz] += color * update_amount
+                intensity = track['confidence']
+
+                # Single voxel per detection — no spreading
+                self.insect_voxels[vx, vy, vz] += intensity
+                self.voxel_colors[vx, vy, vz] += color * intensity
                                 
     def _create_ultimate_visualization(self, frame: np.ndarray, detections: List[Dict], tracks: List[Dict]) -> np.ndarray:
         """Create ultimate visualization."""
@@ -782,18 +769,9 @@ class UltimateInsectTracker:
                     screen_y = int((-world_y / (distance * fov_scale) + 1) * self.height / 2)
                     
                     if 0 <= screen_x < self.width and 0 <= screen_y < self.height:
-                        # Ultra-fine voxel rendering
-                        size = max(1, int(5 * intensity / distance))
+                        size = max(1, min(3, int(2 * intensity / distance)))
                         bgr_color = tuple(map(int, color[::-1] * 255))
-                        
-                        # Multi-layer glow effect
-                        for r in range(size + 3, 0, -1):
-                            alpha = 0.2 * (r / (size + 3)) * intensity
-                            glow_color = tuple(int(c * alpha) for c in bgr_color)
-                            cv2.circle(frame, (screen_x, screen_y), r, glow_color, -1)
-                        
-                        # Bright core
-                        cv2.circle(frame, (screen_x, screen_y), max(1, size), bgr_color, -1)
+                        cv2.circle(frame, (screen_x, screen_y), size, bgr_color, -1)
                         
     def _add_ultimate_stats(self, frame: np.ndarray, detections: List[Dict], tracks: List[Dict]):
         """Add comprehensive statistics display."""

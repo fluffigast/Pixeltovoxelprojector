@@ -2,14 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>BugSpotter - Drone & Insect Detector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BugSpotter - Drone &amp; Insect Detector</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    :focus-visible { outline: 2px solid #81C784; outline-offset: 2px; }
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       background: linear-gradient(135deg, #1a3a1a, #0d1f0d);
+      min-height: 100vh;
       min-height: 100dvh;
       color: #eee;
       display: flex;
@@ -31,8 +34,13 @@
       flex: 1;
       overflow: hidden;
     }
+    @media (min-width: 901px) {
+      /* Fixed-height app shell: the video scales to fit instead of growing the page. */
+      body { height: 100vh; height: 100dvh; }
+      .main { min-height: 0; }
+    }
     @media (max-width: 900px) {
-      .main { flex-direction: column; overflow: auto; }
+      .main { flex-direction: column; overflow: visible; }
     }
 
     /* --- Left column: video --- */
@@ -41,6 +49,7 @@
       display: flex;
       flex-direction: column;
       min-width: 0;
+      min-height: 0;
     }
 
     /* --- Controls bar --- */
@@ -100,7 +109,12 @@
       background: #000;
       min-height: 300px;
     }
-    #videoElement { max-width: 100%; max-height: 100%; object-fit: contain; }
+    #videoElement { width: 100%; height: 100%; object-fit: contain; }
+    @media (max-width: 900px) {
+      /* Stacked layout: the view takes the video's own height, capped. */
+      #view { flex: none; min-height: 200px; }
+      #videoElement { height: auto; max-height: 70vh; max-height: 70dvh; }
+    }
     #overlayCanvas { position: absolute; pointer-events: none; }
 
     #status {
@@ -111,7 +125,11 @@
       text-align: center;
       z-index: 10;
     }
-    #status.hidden { display: none; }
+    #status:not([hidden]) {
+      background: rgba(0,0,0,0.6);
+      padding: 12px 18px;
+      border-radius: 10px;
+    }
     .spinner {
       width: 24px; height: 24px;
       border: 3px solid #555;
@@ -120,13 +138,11 @@
       animation: spin 0.8s linear infinite;
       margin: 0 auto 8px;
     }
-    .spinner.hidden { display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
     #retryBtn {
       background: #c33; color: #fff; border: none; border-radius: 4px;
-      padding: 6px 16px; font-size: 14px; cursor: pointer; margin-top: 8px;
+      padding: 2px 10px; font-size: 12px; cursor: pointer; margin-left: 8px;
     }
-    #retryBtn.hidden { display: none; }
 
     /* --- Right sidebar --- */
     .sidebar {
@@ -137,7 +153,7 @@
       overflow-y: auto;
     }
     @media (max-width: 900px) {
-      .sidebar { width: 100%; max-height: 50vh; }
+      .sidebar { width: 100%; overflow-y: visible; }
     }
 
     .card {
@@ -259,20 +275,19 @@
   </style>
 </head>
 <body>
-  <!-- Header -->
-  <div class="header">
+  <header class="header">
     <h1>BugSpotter</h1>
-    <p>AI-Powered Drone & Insect Detection</p>
-  </div>
+    <p>AI-Powered Drone &amp; Insect Detection</p>
+  </header>
 
-  <div class="main">
+  <main class="main">
     <!-- Left: Video + Controls -->
     <div class="col-video">
       <!-- Controls bar -->
       <div class="controls">
-        <select id="sourceSelect">
-          <option value="sample-new" selected>Sample: New Video</option>
-          <option value="sample-insect">Sample: Insects</option>
+        <select id="sourceSelect" aria-label="Video source" autocomplete="off">
+          <option value="sample-new">Sample: New Video</option>
+          <option value="sample-insect" selected>Sample: Insects</option>
           <option value="sample-drone">Sample: Drone</option>
           <option value="sample-bees">Sample: Bees at Hive</option>
           <option value="sample-dronesky">Sample: Drone in Sky</option>
@@ -283,35 +298,35 @@
         <input type="file" id="fileInput" accept="video/*">
 
         <div class="ctrl-group">
-          <label>Conf: <input type="range" id="confSlider" min="5" max="95" value="25" step="5"><span id="confValue">0.25</span></label>
+          <label title="Minimum YOLO confidence">Conf: <input type="range" id="confSlider" min="5" max="95" value="25" step="5"><span id="confValue">0.25</span></label>
         </div>
         <div class="ctrl-group">
           <label><input type="checkbox" id="motionToggle" checked> Motion</label>
-          <label>Sens: <input type="range" id="motionSlider" min="5" max="60" value="20"><span id="motionValue">20</span></label>
+          <label title="Brightness change needed to count as motion. Lower = more sensitive.">Threshold: <input type="range" id="motionSlider" min="5" max="60" value="20"><span id="motionValue">20</span></label>
         </div>
+        <button type="button" class="btn-sm" id="captureBtn" title="Save the current frame with its overlay (C)">Capture</button>
       </div>
 
       <!-- Upload area (hidden by default) -->
       <div class="upload-area" id="uploadArea">
-        <p>Drag & drop a video file here</p>
+        <p>Drag &amp; drop a video file here</p>
         <p style="font-size:0.8rem; color:#777;">Supports MP4, WebM, MOV</p>
-        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose File</button>
+        <button type="button" class="upload-btn" id="chooseFileBtn">Choose File</button>
       </div>
 
       <!-- Video view -->
       <div id="view">
         <video id="videoElement" playsinline muted loop></video>
         <canvas id="overlayCanvas"></canvas>
-        <div id="status">
+        <div id="status" role="status" aria-live="polite">
           <div class="spinner"></div>
-          <span id="statusText">Loading model...</span>
-          <button id="retryBtn" class="hidden" onclick="location.reload()">Retry</button>
+          <span id="statusText">Loading video...</span>
         </div>
       </div>
     </div>
 
     <!-- Right sidebar -->
-    <div class="sidebar">
+    <aside class="sidebar">
       <!-- Detection counts -->
       <div class="card">
         <h3>Detections</h3>
@@ -338,17 +353,25 @@
           </div>
           <div class="stat-item">
             <div class="stat-value" id="inferDisplay">--</div>
-            <div class="stat-label">Infer</div>
+            <div class="stat-label">YOLO infer</div>
           </div>
         </div>
       </div>
 
       <!-- Settings -->
       <div class="card">
-        <h3>Settings</h3>
+        <h3>Pipeline</h3>
         <div class="setting-row">
           <span>Backend</span>
-          <span class="setting-val" id="backendDisplay">--</span>
+          <span><span class="setting-val" id="backendDisplay">--</span><button type="button" id="retryBtn" hidden>Retry</button></span>
+        </div>
+        <div class="setting-row">
+          <span>Analysis size</span>
+          <span class="setting-val" id="resolutionDisplay">--</span>
+        </div>
+        <div class="setting-row">
+          <span>Motion pass</span>
+          <span class="setting-val" id="motionMsDisplay">--</span>
         </div>
       </div>
 
@@ -356,8 +379,8 @@
       <div class="card">
         <h3>Multi-Device Network</h3>
         <div class="network-row">
-          <input type="text" id="serverUrl" value="ws://localhost:8080" placeholder="ws://server:port">
-          <button class="btn-sm" id="connectBtn">Connect</button>
+          <input type="text" id="serverUrl" value="ws://localhost:8080" placeholder="ws://server:port" aria-label="Relay server URL" spellcheck="false" autocapitalize="off">
+          <button type="button" class="btn-sm" id="connectBtn">Connect</button>
         </div>
         <span class="conn-status disconnected" id="connectionStatus">Disconnected</span>
         <div id="deviceList" style="margin-top:8px;"></div>
@@ -366,33 +389,18 @@
       <!-- Activity log -->
       <div class="card">
         <h3>Activity Log</h3>
-        <div class="log" id="activityLog">
-          <div class="log-entry"><span class="log-time">--</span> Ready</div>
-        </div>
+        <div class="log" id="activityLog"></div>
       </div>
-    </div>
-  </div>
+    </aside>
+  </main>
 
-  <!-- Footer -->
-  <div class="footer-stats">
+  <footer class="footer-stats">
     <span>BugSpotter v2.0</span>
-    <span>Motion: 3-frame diff + max-mean filter</span>
+    <span>Motion: 2-frame diff + connected components</span>
     <span>Press C to capture frame</span>
-  </div>
+  </footer>
 
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
   <script type="module" src="app.js"></script>
-
-  <!-- Toggle upload area visibility based on source selection -->
-  <script>
-    document.getElementById('sourceSelect').addEventListener('change', function(e) {
-      var area = document.getElementById('uploadArea');
-      if (e.target.value === 'upload') {
-        area.classList.add('visible');
-      } else {
-        area.classList.remove('visible');
-      }
-    });
-  </script>
 </body>
 </html>

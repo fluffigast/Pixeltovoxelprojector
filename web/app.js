@@ -2,77 +2,14 @@
 
 import { Detector } from './detector.js';
 import { MotionDetector } from './motion.js';
+import { Tracker } from './tracker.js';
 import { Renderer } from './renderer.js';
 import { Network } from './network.js';
+import { createCanvas } from './util.js';
 
-// --- DOM refs ---
-const video = document.getElementById('videoElement');
-const overlay = document.getElementById('overlayCanvas');
-const statusEl = document.getElementById('status');
-const statusText = document.getElementById('statusText');
-const statusSpinner = statusEl?.querySelector('.spinner');
-const retryBtn = document.getElementById('retryBtn');
-const sourceSelect = document.getElementById('sourceSelect');
-const fileInput = document.getElementById('fileInput');
-const uploadArea = document.getElementById('uploadArea');
-const confSlider = document.getElementById('confSlider');
-const confValue = document.getElementById('confValue');
-const motionToggle = document.getElementById('motionToggle');
-const motionSlider = document.getElementById('motionSlider');
-const motionValue = document.getElementById('motionValue');
-const connectBtn = document.getElementById('connectBtn');
-const serverUrl = document.getElementById('serverUrl');
-const connectionStatus = document.getElementById('connectionStatus');
-const deviceList = document.getElementById('deviceList');
-const logContainer = document.getElementById('activityLog');
-
-// --- Core modules ---
-const detector = new Detector();
-const motionDetector = new MotionDetector();
-const renderer = new Renderer(overlay);
-const network = new Network();
-
-let latestDetections = [];
-let motionEnabled = true;
-let networkMode = null; // null, 'source', 'viewer'
-
-// --- Status display ---
-function showStatus(msg, { spinner = false, retry = false } = {}) {
-  if (!statusEl) return;
-  statusEl.className = '';
-  if (statusText) statusText.textContent = msg;
-  if (statusSpinner) statusSpinner.className = spinner ? 'spinner' : 'spinner hidden';
-  if (retryBtn) retryBtn.className = retry ? '' : 'hidden';
-}
-function hideStatus() {
-  if (statusEl) statusEl.className = 'hidden';
-}
-
-// --- Activity log ---
-function log(message) {
-  if (!logContainer) return;
-  const time = new Date().toLocaleTimeString();
-  const entry = document.createElement('div');
-  entry.className = 'log-entry';
-
-  const timeSpan = document.createElement('span');
-  timeSpan.className = 'log-time';
-  timeSpan.textContent = '[' + time + '] ';
-  entry.appendChild(timeSpan);
-  entry.appendChild(document.createTextNode(message));
-
-  logContainer.appendChild(entry);
-  logContainer.scrollTop = logContainer.scrollHeight;
-  while (logContainer.children.length > 100) {
-    logContainer.removeChild(logContainer.firstChild);
-  }
-}
-
-// --- Video source management ---
-let frameCanvas = null;
-let frameCtx = null;
-let stream = null;
-
+// --- Configuration ---
+const MODEL_URL = 'models/yolov11n.onnx';
+const DEFAULT_SOURCE = 'sample-insect';
 const SAMPLES = {
   'sample-new': 'samples/new_video.mp4',
   'sample-insect': 'samples/insects_flying_forest.mp4',
@@ -82,454 +19,555 @@ const SAMPLES = {
   'sample-faa': 'samples/drone_spotted.mp4',
 };
 
-async function setSource(source) {
+// COCO has no drone or insect class. These are the classes YOLO tends to
+// report for them, mapped to the labels this app uses; everything else is dropped.
+const YOLO_CLASS_MAP = { airplane: 'drone', kite: 'drone', bird: 'bird', cat: 'insect' };
+
+const MAX_PROCESS_SIDE = 1280;   // frames larger than this are downscaled before analysis
+const YOLO_EVERY_N = 5;          // start a YOLO pass every Nth processed frame
+const YOLO_MIN_TTL_MS = 500;     // YOLO boxes expire if no newer result replaces them
+const STATS_INTERVAL_MS = 250;
+const NET_SEND_INTERVAL_MS = 100;
+
+// --- DOM refs ---
+const $ = (id) => document.getElementById(id);
+const video = $('videoElement');
+const view = $('view');
+const overlay = $('overlayCanvas');
+const statusEl = $('status');
+const statusText = $('statusText');
+const statusSpinner = statusEl.querySelector('.spinner');
+const retryBtn = $('retryBtn');
+const sourceSelect = $('sourceSelect');
+const fileInput = $('fileInput');
+const uploadArea = $('uploadArea');
+const chooseFileBtn = $('chooseFileBtn');
+const captureBtn = $('captureBtn');
+const confSlider = $('confSlider');
+const confValue = $('confValue');
+const motionToggle = $('motionToggle');
+const motionSlider = $('motionSlider');
+const motionValue = $('motionValue');
+const connectBtn = $('connectBtn');
+const serverUrl = $('serverUrl');
+const connectionStatus = $('connectionStatus');
+const deviceList = $('deviceList');
+const logContainer = $('activityLog');
+
+// --- Core modules ---
+const detector = new Detector({ classMap: YOLO_CLASS_MAP });
+const motionDetector = new MotionDetector();
+const tracker = new Tracker();
+const renderer = new Renderer(overlay);
+const network = new Network();
+
+// --- Status display ---
+function showStatus(msg, { spinner = false } = {}) {
+  statusText.textContent = msg;
+  statusSpinner.hidden = !spinner;
+  statusEl.hidden = false;
+}
+function hideStatus() {
+  statusEl.hidden = true;
+}
+
+// --- Activity log ---
+function log(message) {
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'log-time';
+  timeSpan.textContent = '[' + new Date().toLocaleTimeString() + '] ';
+  entry.append(timeSpan, message);
+
+  logContainer.appendChild(entry);
+  while (logContainer.children.length > 100) logContainer.firstChild.remove();
+  logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+// --- Pipeline state ---
+let latestDetections = [];   // tracker output, in processing-frame pixels
+let motionEnabled = true;
+let motionMs = null;         // smoothed cost of frame grab + motion + tracking
+let yoloDets = [];
+let yoloTime = 0;
+let framesSinceYolo = 0;
+let procW = 0, procH = 0;    // size frames are analysed at
+let frameCanvas = null;
+let frameCtx = null;
+let backendLabel = 'loading…';
+
+function resetPipeline() {
+  motionDetector.reset();
+  tracker.reset();
+  latestDetections = [];
+  yoloDets = [];
+  framesSinceYolo = 0;
+  motionMs = null;
+  renderer.clear();
+}
+
+// --- Video source management ---
+let stream = null;
+let objectUrl = null;
+let sourceToken = 0;   // bumped on every source change so stale async work can bail out
+
+function releaseSource() {
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
+  video.pause();
   video.srcObject = null;
-  video.src = '';
-  latestDetections = [];
-
-  if (source === 'camera') {
-    showStatus('Starting camera...', { spinner: true });
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-      });
-      video.srcObject = stream;
-      await video.play();
-      hideStatus();
-      log('Camera started');
-    } catch (e) {
-      showStatus('Camera access denied. Use sample videos or upload a file.');
-      log('Camera access denied: ' + e.message);
-      return;
-    }
-  } else if (SAMPLES[source]) {
-    video.src = SAMPLES[source];
-    video.load();
-    try {
-      await video.play();
-      hideStatus();
-      log('Playing sample: ' + source);
-    } catch {
-      showStatus('Could not load video. Try a different file.');
-      return;
-    }
+  video.removeAttribute('src');
+  video.load();
+  if (objectUrl) {
+    URL.revokeObjectURL(objectUrl);
+    objectUrl = null;
   }
 }
 
-function setSourceFromFile(file) {
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
+function cameraErrorMessage(e) {
+  if (e?.name === 'NotFoundError' || e?.name === 'OverconstrainedError') return 'No camera found.';
+  if (e?.name === 'NotReadableError') return 'The camera is in use by another app.';
+  if (!navigator.mediaDevices?.getUserMedia) return 'Camera needs a secure (https) page.';
+  return 'Camera access denied.';
+}
+
+/** @param {string} source key of SAMPLES, 'camera', or 'file' (with `file`) */
+async function setSource(source, file) {
+  const token = ++sourceToken;
+  releaseSource();
+  resetPipeline();
+
+  let description;
+  try {
+    if (source === 'camera') {
+      showStatus('Starting camera...', { spinner: true });
+      const camera = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      if (token !== sourceToken) {          // user picked something else meanwhile
+        camera.getTracks().forEach(t => t.stop());
+        return;
+      }
+      stream = camera;
+      video.srcObject = camera;
+      description = 'Camera started';
+    } else if (source === 'file') {
+      showStatus('Loading video...', { spinner: true });
+      objectUrl = URL.createObjectURL(file);
+      video.src = objectUrl;
+      description = 'Playing uploaded file: ' + file.name;
+    } else if (SAMPLES[source]) {
+      showStatus('Loading video...', { spinner: true });
+      video.src = SAMPLES[source];
+      description = 'Playing sample: ' + source;
+    } else {
+      return;
+    }
+    await video.play();
+  } catch (e) {
+    if (token !== sourceToken) return;      // superseded; the newer call owns the UI
+    if (source === 'camera' && !stream) {
+      showStatus(cameraErrorMessage(e) + ' Use a sample video or upload a file.');
+      log('Camera unavailable: ' + (e?.message || e));
+    } else if (e?.name === 'NotAllowedError') {
+      showStatus('Tap the video to start playback.');
+    } else {
+      showStatus('Could not load video. Try a different file.');
+      log('Video failed to load: ' + (e?.message || e));
+    }
+    return;
   }
-  video.srcObject = null;
-  const url = URL.createObjectURL(file);
-  video.src = url;
-  video.load();
-  video.play().then(() => {
-    hideStatus();
-    log('Playing uploaded file: ' + file.name);
-  }).catch(() => {
-    showStatus('Could not load video. Try a different file.');
-  });
+  if (token !== sourceToken) return;
+  hideStatus();
+  log(description);
 }
 
 // --- Frame capture ---
 function getFrame() {
   if (video.readyState < 2) return null;
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (!w || !h) return null;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
 
-  if (!frameCanvas || frameCanvas.width !== w || frameCanvas.height !== h) {
-    frameCanvas = new OffscreenCanvas(w, h);
-    frameCtx = frameCanvas.getContext('2d');
+  // Analyse at native size up to MAX_PROCESS_SIDE; larger sources (1080p, 4K)
+  // are downscaled so the per-frame pixel work stays bounded.
+  const scale = Math.min(1, MAX_PROCESS_SIDE / Math.max(vw, vh));
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+  if (!frameCanvas || procW !== w || procH !== h) {
+    procW = w;
+    procH = h;
+    frameCanvas = createCanvas(w, h);
+    frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+    resetPipeline();
+    updateLayout();
   }
   frameCtx.drawImage(video, 0, 0, w, h);
   return frameCtx.getImageData(0, 0, w, h);
 }
 
 // --- Detection merging ---
-function mergeDetections(yoloDetections, motionBlobs) {
-  // Only keep relevant YOLO classes
-  const relevantYolo = yoloDetections.filter(d => {
-    const name = d.label;
-    return name === 'airplane' || name === 'bird' || name === 'kite' || name === 'cat';
-  });
+function overlaps(a, b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
 
-  // Map YOLO labels to our classes
-  for (const d of relevantYolo) {
-    if (d.label === 'airplane' || d.label === 'kite') d.label = 'drone';
-    else if (d.label === 'cat') d.label = 'insect';
-  }
-
-  const merged = [...relevantYolo];
-
+/** YOLO boxes plus every motion blob that no YOLO box already covers. */
+function mergeDetections(yolo, motionBlobs) {
+  if (!yolo.length) return motionBlobs;
+  const merged = [...yolo];
   for (const blob of motionBlobs) {
-    const overlaps = relevantYolo.some(d => {
-      const ox = Math.max(0, Math.min(d.x + d.w, blob.x + blob.w) - Math.max(d.x, blob.x));
-      const oy = Math.max(0, Math.min(d.y + d.h, blob.y + blob.h) - Math.max(d.y, blob.y));
-      return (ox * oy) > 0;
-    });
-    if (!overlaps) {
-      merged.push(blob);
-    }
+    if (!yolo.some(d => overlaps(d, blob))) merged.push(blob);
   }
   return merged;
 }
 
-// --- Simple tracker: snap to detections, brief persistence ---
-const tracks = new Map();
-let nextTrackId = 1;
-const MAX_MATCH_DIST = 80;
-const MAX_MISSED = 3;
+// --- Overlay layout ---
+// Position of the displayed video picture inside #view, in CSS pixels.
+let layout = { x: 0, y: 0, w: 0, h: 0 };
 
-function classifyBySize(w, h) {
-  const area = w * h;
-  if (area < 900) return 'insect';
-  if (area < 90000) return 'unknown';
-  return 'drone';
-}
-
-function trackDetections(detections) {
-  const usedTracks = new Set();
-  const usedDets = new Set();
-
-  // Build all detection-track pairs, sort by distance, greedy assign
-  const pairs = [];
-  for (const det of detections) {
-    const dcx = det.x + det.w / 2;
-    const dcy = det.y + det.h / 2;
-    for (const [id, t] of tracks) {
-      const d = Math.hypot(dcx - t.cx, dcy - t.cy);
-      if (d < MAX_MATCH_DIST) {
-        pairs.push({ det, id, dist: d });
-      }
-    }
-  }
-  pairs.sort((a, b) => a.dist - b.dist);
-
-  for (const p of pairs) {
-    if (usedTracks.has(p.id) || usedDets.has(p.det)) continue;
-    const t = tracks.get(p.id);
-    const dcx = p.det.x + p.det.w / 2;
-    const dcy = p.det.y + p.det.h / 2;
-
-    // Snap directly to detection position — no smoothing, no drift
-    t.cx = dcx;
-    t.cy = dcy;
-    t.w = p.det.w; t.h = p.det.h;
-    t.confidence = p.det.confidence;
-    t.source = p.det.source;
-    t.missed = 0;
-    t.age++;
-
-    if (p.det.source === 'yolo' && p.det.label) {
-      t.label = p.det.label;
-    } else if (p.det.source === 'motion') {
-      t.label = classifyBySize(p.det.w, p.det.h);
-    }
-
-    usedTracks.add(p.id);
-    usedDets.add(p.det);
-  }
-
-  // New tracks for unmatched detections
-  for (const det of detections) {
-    if (usedDets.has(det)) continue;
-    const cx = det.x + det.w / 2;
-    const cy = det.y + det.h / 2;
-    const label = det.label || classifyBySize(det.w, det.h);
-    tracks.set(nextTrackId++, {
-      cx, cy, w: det.w, h: det.h,
-      label, confidence: det.confidence, source: det.source,
-      missed: 0, age: 1
-    });
-  }
-
-  // Remove stale tracks quickly — no coasting, no ghost markers
-  for (const [id, t] of tracks) {
-    if (!usedTracks.has(id)) t.missed++;
-    if (t.missed > MAX_MISSED) tracks.delete(id);
-  }
-
-  const out = [];
-  for (const [, t] of tracks) {
-    out.push({
-      x: Math.round(t.cx - t.w / 2),
-      y: Math.round(t.cy - t.h / 2),
-      w: t.w, h: t.h,
-      label: t.label, confidence: t.confidence, source: t.source,
-      missed: t.missed
-    });
-  }
-  return out;
-}
-
-// --- Overlay sync ---
-function getVideoContentRect() {
+function updateLayout() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
   const videoRect = video.getBoundingClientRect();
-  const viewRect = video.parentElement.getBoundingClientRect();
-  const vw = video.videoWidth || 1;
-  const vh = video.videoHeight || 1;
-  const elemW = videoRect.width;
-  const elemH = videoRect.height;
-  const scale = Math.min(elemW / vw, elemH / vh);
-  const contentW = vw * scale;
-  const contentH = vh * scale;
-  const offsetX = (videoRect.left - viewRect.left) + (elemW - contentW) / 2;
-  const offsetY = (videoRect.top - viewRect.top) + (elemH - contentH) / 2;
-  return { x: offsetX, y: offsetY, w: contentW, h: contentH, scale };
-}
+  const viewRect = view.getBoundingClientRect();
+  const scale = Math.min(videoRect.width / vw, videoRect.height / vh);
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+  const x = Math.round(videoRect.left - viewRect.left + (videoRect.width - w) / 2);
+  const y = Math.round(videoRect.top - viewRect.top + (videoRect.height - h) / 2);
+  layout = { x, y, w, h };
 
-function syncOverlay() {
-  const cr = getVideoContentRect();
-  const w = Math.round(cr.w);
-  const h = Math.round(cr.h);
-  if (overlay.width !== w || overlay.height !== h) {
-    overlay.width = w;
-    overlay.height = h;
-  }
-  overlay.style.left = Math.round(cr.x) + 'px';
-  overlay.style.top = Math.round(cr.y) + 'px';
+  overlay.style.left = x + 'px';
+  overlay.style.top = y + 'px';
   overlay.style.width = w + 'px';
   overlay.style.height = h + 'px';
+  renderer.resize(w, h);
 }
 
-function scaleDetections(detections) {
-  const cr = getVideoContentRect();
-  const vw = video.videoWidth || 1;
-  const vh = video.videoHeight || 1;
-  const sx = cr.w / vw;
-  const sy = cr.h / vh;
-  return detections.map(d => ({
+function render() {
+  if (!procW || !layout.w) return;
+  const sx = layout.w / procW;
+  const sy = layout.h / procH;
+  renderer.draw(latestDetections.map(d => ({
     ...d,
     x: Math.round(d.x * sx),
     y: Math.round(d.y * sy),
     w: Math.round(d.w * sx),
     h: Math.round(d.h * sy),
-  }));
+  })));
 }
 
-// --- Render loop ---
-let lastFrameTime = performance.now();
-let fps = 0;
-let frameCount = 0;
+// Resizing the window or the video element clears the canvas, so redraw.
+new ResizeObserver(() => { updateLayout(); render(); }).observe(video);
+video.addEventListener('resize', () => { updateLayout(); render(); });
 
+// --- Per-frame processing ---
+let framesInWindow = 0;
+let lastNetSend = 0;
+
+function runYolo() {
+  const token = sourceToken;
+  detector.detect(frameCanvas, procW, procH).then((dets) => {
+    if (!dets || token !== sourceToken) return;   // busy/not ready, or the source changed
+    yoloDets = dets;
+    yoloTime = performance.now();
+  }).catch((e) => {
+    console.warn('YOLO inference failed:', e);
+  });
+}
+
+function processFrame() {
+  const now = performance.now();
+  const frame = getFrame();
+  if (!frame) return;
+
+  const motionBlobs = motionEnabled ? motionDetector.update(frame) : [];
+
+  // Stop drawing YOLO boxes that are no longer being refreshed (slow model,
+  // failed run) instead of leaving them frozen on screen.
+  if (yoloDets.length && now - yoloTime > Math.max(YOLO_MIN_TTL_MS, detector.lastInferMs * 2.5)) {
+    yoloDets = [];
+  }
+  latestDetections = tracker.update(mergeDetections(yoloDets, motionBlobs));
+
+  const elapsed = performance.now() - now;
+  motionMs = motionMs === null ? elapsed : motionMs * 0.9 + elapsed * 0.1;
+
+  if (++framesSinceYolo >= YOLO_EVERY_N && detector.ready && !detector.busy) {
+    framesSinceYolo = 0;
+    runYolo();
+  }
+
+  if (network.connected && network.role === 'source' && now - lastNetSend >= NET_SEND_INTERVAL_MS) {
+    lastNetSend = now;
+    network.sendDetections(latestDetections, procW, procH);
+  }
+
+  framesInWindow++;
+  render();
+}
+
+// Process each decoded video frame exactly once. Driving this from
+// requestAnimationFrame alone would diff a frame against itself whenever the
+// display refreshes faster than the video, which reads as "no motion".
+const hasVideoFrameCallback = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+let lastMediaTime = -1;
+
+function onFrame() {
+  try {
+    if (hasVideoFrameCallback || video.currentTime !== lastMediaTime) {
+      lastMediaTime = video.currentTime;
+      processFrame();
+    }
+  } finally {
+    scheduleFrame();
+  }
+}
+
+function scheduleFrame() {
+  if (hasVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame(onFrame);
+}
+
+// --- Stats ---
 function countByClass(detections) {
   const counts = { insect: 0, drone: 0, bird: 0, unknown: 0 };
   for (const d of detections) {
-    const cls = d.label || 'unknown';
-    if (counts[cls] !== undefined) counts[cls]++;
+    if (counts[d.label] !== undefined) counts[d.label]++;
     else counts.unknown++;
   }
   return counts;
 }
 
-function renderLoop() {
-  frameCount++;
-  const now = performance.now();
-  if (now - lastFrameTime >= 1000) {
-    fps = frameCount;
-    frameCount = 0;
-    lastFrameTime = now;
-  }
+let fps = null;
+let fpsWindowStart = performance.now();
 
-  syncOverlay();
-  const scaled = scaleDetections(latestDetections);
-  renderer.draw(scaled);
+function updateStats() {
+  const now = performance.now();
+  if (now - fpsWindowStart >= 1000) {
+    fps = Math.round(framesInWindow * 1000 / (now - fpsWindowStart));
+    framesInWindow = 0;
+    fpsWindowStart = now;
+  }
   renderer.updateStats({
     fps,
     count: latestDetections.length,
-    backend: detector.getBackend(),
-    inferMs: lastInferMs,
+    backend: backendLabel,
+    inferMs: detector.lastInferMs,
+    motionMs,
+    resolution: procW ? procW + '×' + procH : '',
     classCounts: countByClass(latestDetections),
   });
-
-  requestAnimationFrame(renderLoop);
 }
 
-// --- Inference loops (decoupled: motion runs fast, YOLO runs slow) ---
-let lastInferMs = 0;
-let lastYoloDets = [];
-let yoloRunning = false;
-let yoloFrameCount = 0;
-const YOLO_EVERY_N = 5; // run YOLO every Nth frame
-
-// Fast loop: motion detection every frame
-function motionLoop() {
-  const frame = getFrame();
-  if (frame) {
-    const t0 = performance.now();
-
-    const motionBlobs = motionEnabled ? motionDetector.update(frame) : [];
-    const merged = mergeDetections(lastYoloDets, motionBlobs);
-    latestDetections = trackDetections(merged);
-    lastInferMs = Math.round(performance.now() - t0);
-
-    // Kick off YOLO periodically (non-blocking)
-    yoloFrameCount++;
-    if (yoloFrameCount >= YOLO_EVERY_N && !yoloRunning) {
-      yoloFrameCount = 0;
-      yoloRunning = true;
-      detector.detect(frame).then(dets => {
-        lastYoloDets = dets;
-        yoloRunning = false;
-      }).catch(() => { yoloRunning = false; });
-    }
-
-    // Send to network if connected as source
-    if (network.connected && networkMode === 'source') {
-      network.sendDetections(latestDetections);
-    }
-  }
-
-  requestAnimationFrame(motionLoop);
+// --- Frame capture to PNG (video + overlay) ---
+function captureFrame() {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, w, h);
+  if (overlay.width && overlay.height) ctx.drawImage(overlay, 0, 0, w, h);
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.download = 'capture-' + Date.now() + '.png';
+    link.href = url;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    log('Frame captured');
+  }, 'image/png');
 }
 
 // --- Networking ---
+const remoteSources = new Map();   // sourceId -> { name, summary }
+
+function renderDeviceList() {
+  deviceList.textContent = '';
+  for (const { name, summary } of remoteSources.values()) {
+    const item = document.createElement('div');
+    item.className = 'device-item';
+    const dot = document.createElement('span');
+    dot.className = 'device-dot connected';
+    item.append(dot, ' ' + name + (summary ? ' — ' + summary : ''));
+    deviceList.appendChild(item);
+  }
+}
+
 function setupNetwork() {
-  if (!connectBtn) return;
+  // When the page is served by server.js the relay lives on the same host.
+  if (location.protocol === 'http:' && location.port) serverUrl.value = 'ws://' + location.host;
+
+  const role = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'source';
+
+  network.onStateChange = (state) => {
+    const connected = state === 'connected';
+    connectBtn.textContent = state === 'disconnected' ? 'Connect' : 'Disconnect';
+    connectionStatus.className = 'conn-status ' + (connected ? 'connected' : 'disconnected');
+    connectionStatus.textContent = {
+      disconnected: 'Disconnected',
+      connecting: 'Connecting…',
+      connected: 'Connected (' + role + ')',
+      reconnecting: 'Reconnecting…',
+    }[state];
+    if (!connected) {
+      remoteSources.clear();
+      renderDeviceList();
+    }
+    if (state !== 'connecting') {
+      log({
+        connected: 'Connected to server as ' + role,
+        reconnecting: 'No connection to server, retrying…',
+        disconnected: 'Disconnected from server',
+      }[state]);
+    }
+  };
+
+  network.onSources = (sources) => {
+    const previous = new Map(remoteSources);
+    remoteSources.clear();
+    for (const s of sources) {
+      remoteSources.set(s.id, { name: s.name, summary: previous.get(s.id)?.summary || '' });
+    }
+    renderDeviceList();
+  };
+
+  network.onDetections = (sourceId, sourceName, detections) => {
+    const c = countByClass(detections);
+    const summary = detections.length + ' tracked (' + c.insect + ' insect, ' + c.drone + ' drone, ' + c.bird + ' bird)';
+    const entry = remoteSources.get(sourceId);
+    if (entry?.summary === summary) return;
+    remoteSources.set(sourceId, { name: sourceName, summary });
+    renderDeviceList();
+  };
 
   connectBtn.addEventListener('click', () => {
-    if (network.connected) {
+    if (network.state !== 'disconnected') {
       network.disconnect();
-      connectBtn.textContent = 'Connect';
-      if (connectionStatus) connectionStatus.textContent = 'Disconnected';
-      if (connectionStatus) connectionStatus.className = 'conn-status disconnected';
-      log('Disconnected from server');
       return;
     }
-
-    const url = serverUrl?.value || 'ws://localhost:8080';
-    const params = new URLSearchParams(window.location.search);
-    const role = params.get('role') || 'source';
-    networkMode = role;
-
-    network.connect(url, role, navigator.userAgent.includes('Mobile') ? 'Phone' : 'Desktop');
-
-    network.onConnect = () => {
-      connectBtn.textContent = 'Disconnect';
-      if (connectionStatus) connectionStatus.textContent = 'Connected (' + role + ')';
-      if (connectionStatus) connectionStatus.className = 'conn-status connected';
-      log('Connected to server as ' + role);
-    };
-
-    network.onDisconnect = () => {
-      connectBtn.textContent = 'Connect';
-      if (connectionStatus) connectionStatus.textContent = 'Disconnected';
-      if (connectionStatus) connectionStatus.className = 'conn-status disconnected';
-      log('Disconnected from server');
-    };
-
-    network.onSources = (sources) => {
-      if (!deviceList) return;
-      deviceList.textContent = '';
-      for (const s of sources) {
-        const div = document.createElement('div');
-        div.className = 'device-item';
-        const dot = document.createElement('span');
-        dot.className = 'device-dot connected';
-        div.appendChild(dot);
-        div.appendChild(document.createTextNode(' ' + s.name));
-        deviceList.appendChild(div);
-      }
-    };
+    const url = serverUrl.value.trim() || 'ws://localhost:8080';
+    try {
+      network.connect(url, role, navigator.userAgent.includes('Mobile') ? 'Phone' : 'Desktop');
+    } catch (e) {
+      log(e.message);
+      return;
+    }
+    if (location.protocol === 'https:' && url.startsWith('ws://') && !/^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(url)) {
+      log('Browsers block ws:// from an https:// page — use wss:// or open the app from the server itself.');
+    }
   });
 }
 
 // --- UI event handlers ---
-if (sourceSelect) {
-  sourceSelect.addEventListener('change', (e) => {
-    const val = e.target.value;
-    if (val === 'upload') {
-      fileInput?.click();
-    } else {
-      setSource(val);
-    }
+sourceSelect.addEventListener('change', () => {
+  const value = sourceSelect.value;
+  uploadArea.classList.toggle('visible', value === 'upload');
+  if (value === 'upload') fileInput.click();
+  else setSource(value);
+});
+
+chooseFileBtn.addEventListener('click', () => fileInput.click());
+
+function useFile(file) {
+  if (!file) return;
+  sourceSelect.value = 'upload';
+  uploadArea.classList.add('visible');
+  setSource('file', file);
+}
+
+fileInput.addEventListener('change', () => {
+  useFile(fileInput.files[0]);
+  fileInput.value = '';   // so picking the same file again still fires `change`
+});
+
+// Drag and drop onto the upload area or straight onto the video
+for (const target of [uploadArea, view]) {
+  for (const type of ['dragenter', 'dragover']) {
+    target.addEventListener(type, (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+  }
+  for (const type of ['dragleave', 'drop']) {
+    target.addEventListener(type, (e) => { e.preventDefault(); uploadArea.classList.remove('dragover'); });
+  }
+  target.addEventListener('drop', (e) => {
+    useFile(Array.from(e.dataTransfer.files).find(f => f.type.startsWith('video/')));
   });
 }
 
-if (fileInput) {
-  fileInput.addEventListener('change', (e) => {
-    if (e.target.files[0]) setSourceFromFile(e.target.files[0]);
-  });
+function applyConfidence() {
+  const v = Number(confSlider.value) / 100;
+  confValue.textContent = v.toFixed(2);
+  detector.setConfidenceThreshold(v);
 }
+confSlider.addEventListener('input', applyConfidence);
 
-// Drag and drop on upload area
-if (uploadArea) {
-  ['dragenter', 'dragover'].forEach(ev => {
-    uploadArea.addEventListener(ev, (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
-  });
-  ['dragleave', 'drop'].forEach(ev => {
-    uploadArea.addEventListener(ev, (e) => { e.preventDefault(); uploadArea.classList.remove('dragover'); });
-  });
-  uploadArea.addEventListener('drop', (e) => {
-    e.preventDefault();
-    const file = Array.from(e.dataTransfer.files).find(f => f.type.startsWith('video/'));
-    if (file) setSourceFromFile(file);
-  });
+function applyMotionSettings() {
+  motionEnabled = motionToggle.checked;
+  motionSlider.disabled = !motionEnabled;
+  if (!motionEnabled) motionDetector.reset();   // don't diff against a stale frame later
+  const v = Number(motionSlider.value);
+  motionValue.textContent = v;
+  motionDetector.setThreshold(v);
 }
+motionToggle.addEventListener('change', applyMotionSettings);
+motionSlider.addEventListener('input', applyMotionSettings);
 
-if (confSlider) {
-  confSlider.addEventListener('input', (e) => {
-    const v = parseInt(e.target.value) / 100;
-    if (confValue) confValue.textContent = v.toFixed(2);
-    detector.setConfidenceThreshold(v);
-  });
-}
-
-if (motionToggle) {
-  motionToggle.addEventListener('change', (e) => {
-    motionEnabled = e.target.checked;
-    if (motionSlider) motionSlider.disabled = !motionEnabled;
-  });
-}
-
-if (motionSlider) {
-  motionSlider.addEventListener('input', (e) => {
-    const v = parseInt(e.target.value);
-    if (motionValue) motionValue.textContent = v;
-    motionDetector.setThreshold(v);
-  });
-}
-
-// Keyboard shortcuts
+captureBtn.addEventListener('click', captureFrame);
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-  if (e.code === 'KeyC') {
-    const link = document.createElement('a');
-    link.download = 'capture-' + Date.now() + '.png';
-    link.href = overlay.toDataURL();
-    link.click();
-    log('Frame captured');
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;   // leave Ctrl+C etc. alone
+  if (e.target.matches?.('input, select, textarea')) return;
+  if (e.code === 'KeyC') captureFrame();
+});
+
+// Browsers that refuse autoplay need a gesture; any tap on the video will do.
+view.addEventListener('click', () => {
+  if (video.paused && (video.currentSrc || video.srcObject)) {
+    video.play().then(hideStatus).catch(() => {});
   }
 });
 
+retryBtn.addEventListener('click', loadModel);
+
 // --- Init ---
-async function init() {
-  showStatus('Loading model...', { spinner: true });
+async function loadModel() {
+  retryBtn.hidden = true;
+  backendLabel = 'loading…';
   log('Loading YOLO model...');
-
   try {
-    await detector.init('models/yolov11n.onnx');
-    log('Model loaded (' + detector.getBackend() + ' backend)');
+    await detector.init(MODEL_URL, {
+      onProgress: (p) => { backendLabel = 'loading ' + Math.round(p * 100) + '%'; },
+    });
+    backendLabel = detector.getBackend();
+    log('Model loaded (' + backendLabel + ' backend)');
   } catch (e) {
-    showStatus("Your browser doesn't support ONNX Runtime. Try Chrome or Edge.", { retry: true });
-    log('Model load failed: ' + e.message);
-    return;
+    // Motion detection does not need the model, so keep running without it.
+    backendLabel = 'motion only';
+    retryBtn.hidden = false;
+    log('Model unavailable, running motion detection only: ' + (e?.message || e));
   }
+}
 
-  showStatus('Warming up...', { spinner: true });
-  await setSource('sample-insect');
-
+function init() {
+  applyConfidence();
+  applyMotionSettings();
   setupNetwork();
 
-  requestAnimationFrame(renderLoop);
-  requestAnimationFrame(motionLoop);
+  // Start on a sample; never open the camera or a file dialog unprompted.
+  if (!SAMPLES[sourceSelect.value]) sourceSelect.value = DEFAULT_SOURCE;
+  uploadArea.classList.remove('visible');
+  setSource(sourceSelect.value);
+
+  scheduleFrame();
+  setInterval(updateStats, STATS_INTERVAL_MS);
+  loadModel();   // in the background: video and motion detection start right away
 }
 
 init();

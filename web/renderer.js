@@ -7,34 +7,46 @@ const CLASS_COLORS = {
   unknown: { stroke: '#FFD740', fill: 'rgba(255,215,64,', glow: '#FFD740' },
 };
 
-function getColors(det) {
-  const label = det.label || 'unknown';
-  if (CLASS_COLORS[label]) return CLASS_COLORS[label];
-  const name = det.label;
-  if (name === 'airplane' || name === 'kite') return CLASS_COLORS.drone;
-  if (name === 'bird') return CLASS_COLORS.bird;
-  return CLASS_COLORS.unknown;
-}
+const STAT_IDS = [
+  'fpsDisplay', 'countDisplay', 'insectCount', 'droneCount', 'birdCount',
+  'inferDisplay', 'backendDisplay', 'motionMsDisplay', 'resolutionDisplay',
+];
 
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
+    this.width = 0;    // CSS pixels
+    this.height = 0;
+    this._statEls = {};
+    this._statText = {};
+    for (const id of STAT_IDS) this._statEls[id] = document.getElementById(id);
   }
 
+  /** Size the overlay in CSS pixels; the backing store follows devicePixelRatio. */
   resize(width, height) {
-    this.canvas.width = width;
-    this.canvas.height = height;
+    const dpr = window.devicePixelRatio || 1;
+    const bw = Math.round(width * dpr);
+    const bh = Math.round(height * dpr);
+    if (this.canvas.width !== bw || this.canvas.height !== bh) {
+      this.canvas.width = bw;
+      this.canvas.height = bh;
+    }
+    this.width = width;
+    this.height = height;
+    // Draw calls below use CSS pixels.
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
+  /** @param detections boxes in overlay CSS pixels */
   draw(detections) {
     const ctx = this.ctx;
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.clearRect(0, 0, this.width, this.height);
 
     const sorted = [...detections].sort((a, b) => (a.w * a.h) - (b.w * b.h));
 
     for (const det of sorted) {
-      const colors = getColors(det);
+      const colors = CLASS_COLORS[det.label] || CLASS_COLORS.unknown;
       const { x, y, w, h } = det;
       const cx = x + w / 2;
       const cy = y + h / 2;
@@ -150,29 +162,30 @@ export class Renderer {
     }
   }
 
+  /** Update the sidebar. Only touches the DOM for values that changed. */
   updateStats(stats) {
     const set = (id, text) => {
-      const el = document.getElementById(id);
+      text = String(text);
+      if (this._statText[id] === text) return;
+      this._statText[id] = text;
+      const el = this._statEls[id];
       if (el) el.textContent = text;
     };
-    set('fpsDisplay', stats.fps);
+    set('fpsDisplay', stats.fps ?? '--');
     set('countDisplay', stats.count);
     set('backendDisplay', stats.backend);
-    set('inferDisplay', stats.inferMs + 'ms');
+    set('inferDisplay', stats.inferMs ? stats.inferMs + 'ms' : '--');
+    set('motionMsDisplay', stats.motionMs != null ? stats.motionMs.toFixed(1) + 'ms' : '--');
+    set('resolutionDisplay', stats.resolution || '--');
+    set('insectCount', stats.classCounts?.insect ?? 0);
+    set('droneCount', stats.classCounts?.drone ?? 0);
+    set('birdCount', stats.classCounts?.bird ?? 0);
 
-    if (stats.classCounts) {
-      set('insectCount', stats.classCounts.insect || 0);
-      set('droneCount', stats.classCounts.drone || 0);
-      set('birdCount', stats.classCounts.bird || 0);
-    }
-
-    const fpsEl = document.getElementById('fpsDisplay');
-    if (fpsEl) {
-      fpsEl.parentElement.className = stats.fps < 5 ? 'stat-item stat-warn' : 'stat-item';
-    }
+    const fpsTile = this._statEls.fpsDisplay?.parentElement;
+    if (fpsTile) fpsTile.classList.toggle('stat-warn', stats.fps != null && stats.fps < 5);
   }
 
   clear() {
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.ctx.clearRect(0, 0, this.width, this.height);
   }
 }

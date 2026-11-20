@@ -11,6 +11,8 @@ export class Network {
     this.connected = false;
     /** 'disconnected' | 'connecting' | 'connected' | 'reconnecting' */
     this.state = 'disconnected';
+    /** Human-readable reason for the current state, when there is one. */
+    this.detail = '';
 
     this.onStateChange = null; // callback: (state) => {}
     this.onSources = null;     // callback: (sources) => {}
@@ -95,6 +97,11 @@ export class Network {
       this._open();
     }, this._reconnectDelay);
     this._reconnectDelay = Math.min(this._reconnectDelay * 2, RECONNECT_MAX_MS);
+  }
+
+  /** Bytes queued but not yet sent; callers skip frames while this is large. */
+  get bufferedAmount() {
+    return this.ws ? this.ws.bufferedAmount : 0;
   }
 
   _send(msg) {

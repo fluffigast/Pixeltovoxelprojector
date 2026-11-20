@@ -13,6 +13,8 @@ export function classifyBySize(w, h) {
   return 'drone';
 }
 
+const TRAIL_LEN = 16;   // recent centres kept per track, drawn as a flight path
+
 export class Tracker {
   constructor(options = {}) {
     this.maxMatchDist = options.maxMatchDist ?? 60;   // px from the predicted position
@@ -30,7 +32,7 @@ export class Tracker {
    * @param {Array<{x,y,w,h,label,confidence,source}>} detections
    * @returns {Array} one entry per confirmed live track: detection shape plus `id`, `missed`, `vx`, `vy`
    */
-  update(detections) {
+  update(detections, _shift = null, _masks = []) {   // extra args accepted for app.js compatibility
     const tracks = this.tracks;
     const centres = detections.map(d => ({ cx: d.x + d.w / 2, cy: d.y + d.h / 2 }));
 
@@ -67,6 +69,8 @@ export class Tracker {
       t.missed = 0;
       t.hits++;
       t.age++;
+      t.trail.push([cx, cy]);
+      if (t.trail.length > TRAIL_LEN) t.trail.shift();
 
       if (det.source === 'yolo' && det.label) {
         t.label = det.label;
@@ -95,6 +99,7 @@ export class Tracker {
         classified,
         confidence: det.confidence, source: det.source,
         missed: 0, hits: 1, age: 1,
+        trail: [[centres[di].cx, centres[di].cy]],
       });
     }
 
@@ -111,6 +116,7 @@ export class Tracker {
         vx: t.vx, vy: t.vy,
         label: t.label, confidence: t.confidence, source: t.source,
         missed: t.missed,
+        trail: t.trail,
       });
     }
     return out;

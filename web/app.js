@@ -5,6 +5,8 @@ import { MotionDetector } from './motion.js';
 import { Tracker } from './tracker.js';
 import { Renderer } from './renderer.js';
 import { Network } from './network.js';
+import { PeerLink, newRoomCode, normalizeRoomCode } from './peer.js';
+import { Dashboard, countByClass } from './dashboard.js';
 import { createCanvas } from './util.js';
 
 // --- Configuration ---
@@ -20,15 +22,30 @@ const SAMPLES = {
   'sample-bees': 'samples/bees_hive.mp4',
 };
 
-// COCO has no drone or insect class. These are the classes YOLO tends to
-// report for them, mapped to the labels this app uses; everything else is dropped.
-const YOLO_CLASS_MAP = { airplane: 'drone', kite: 'drone', bird: 'bird', cat: 'insect' };
+// What the COCO model is used for. It has no insect or drone class, so:
+//  • drones are what it reports as airplane or kite, birds are birds;
+//  • insects come from the motion tracker alone;
+//  • big things that move for other reasons become masks — motion inside
+//    their boxes is ignored, so a waving hand does not turn into "insects".
+const MASK = 'mask';
+const YOLO_CLASS_MAP = { airplane: 'drone', kite: 'drone', bird: 'bird' };
+for (const name of ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'train', 'truck', 'boat',
+  'cat', 'dog', 'horse', 'sheep', 'cow']) YOLO_CLASS_MAP[name] = MASK;
+const MASK_MARGIN = 0.08;        // masks are grown by this fraction on every side
 
-const MAX_PROCESS_SIDE = 1280;   // frames larger than this are downscaled before analysis
+const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+// Frames larger than this are downscaled before analysis. Phones get a smaller
+// budget: the per-pixel work is what limits their frame rate.
+const MAX_PROCESS_SIDE = IS_MOBILE ? 960 : 1280;
 const YOLO_EVERY_N = 5;          // start a YOLO pass every Nth processed frame
 const YOLO_MIN_TTL_MS = 500;     // YOLO boxes expire if no newer result replaces them
 const STATS_INTERVAL_MS = 250;
-const NET_SEND_INTERVAL_MS = 100;
+
+// Sharing this device's picture with a dashboard
+const SHARE_INTERVAL_MS = 200;        // 5 preview frames per second
+const SHARE_MAX_SIDE = 480;           // preview size, px
+const SHARE_JPEG_QUALITY = 0.5;
+const SHARE_MAX_BUFFERED = 1 << 20;   // skip frames while this many bytes are still queued
 
 // --- DOM refs ---
 const $ = (id) => document.getElementById(id);
@@ -49,6 +66,13 @@ const confValue = $('confValue');
 const motionToggle = $('motionToggle');
 const motionSlider = $('motionSlider');
 const motionValue = $('motionValue');
+const dashboardEl = $('dashboard');
+const roomInput = $('roomInput');
+const joinBtn = $('joinBtn');
+const dashboardBtn = $('dashboardBtn');
+const roomInfo = $('roomInfo');
+const roomCodeEl = $('roomCode');
+const copyLinkBtn = $('copyLinkBtn');
 const connectBtn = $('connectBtn');
 const serverUrl = $('serverUrl');
 const connectionStatus = $('connectionStatus');
@@ -60,7 +84,14 @@ const detector = new Detector({ classMap: YOLO_CLASS_MAP });
 const motionDetector = new MotionDetector();
 const tracker = new Tracker();
 const renderer = new Renderer(overlay);
-const network = new Network();
+const dashboard = new Dashboard(dashboardEl);
+const params = new URLSearchParams(location.search);
+// Two ways to link devices, with the same interface: room codes (device to
+// device, works from the hosted page) and the WebSocket relay in server.js.
+const peerLink = new PeerLink({ broker: params.get('peer') });
+const relayLink = new Network();
+let link = null;             // whichever of the two is in use
+let dashboardMode = false;   // this device is showing other devices' feeds
 
 // --- Status display ---
 function showStatus(msg, { spinner = false } = {}) {
@@ -215,14 +246,25 @@ function overlaps(a, b) {
   return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
-/** YOLO boxes plus every motion blob that no YOLO box already covers. */
+/** Model detections plus every motion blob that no model box already covers. */
 function mergeDetections(yolo, motionBlobs) {
   if (!yolo.length) return motionBlobs;
-  const merged = [...yolo];
+  const merged = yolo.filter(d => d.label !== MASK);
   for (const blob of motionBlobs) {
     if (!yolo.some(d => overlaps(d, blob))) merged.push(blob);
   }
   return merged;
+}
+
+/** Regions where motion is explained by something the model recognised. */
+function maskRegions(yolo) {
+  const masks = [];
+  for (const d of yolo) {
+    if (d.label !== MASK) continue;
+    const mx = d.w * MASK_MARGIN, my = d.h * MASK_MARGIN;
+    masks.push({ x: d.x - mx, y: d.y - my, w: d.w + 2 * mx, h: d.h + 2 * my });
+  }
+  return masks;
 }
 
 // --- Overlay layout ---
@@ -259,6 +301,7 @@ function render() {
     y: Math.round(d.y * sy),
     w: Math.round(d.w * sx),
     h: Math.round(d.h * sy),
+    trail: d.trail && d.trail.map(p => [p[0] * sx, p[1] * sy]),
   })));
 }
 
@@ -268,7 +311,29 @@ video.addEventListener('resize', () => { updateLayout(); render(); });
 
 // --- Per-frame processing ---
 let framesInWindow = 0;
-let lastNetSend = 0;
+let lastShare = 0;
+let shareCanvas = null;
+let shareCtx = null;
+
+/** Send a small JPEG of the current frame plus its detections to the dashboard. */
+function shareFrame() {
+  const scale = Math.min(1, SHARE_MAX_SIDE / Math.max(procW, procH));
+  const w = Math.round(procW * scale);
+  const h = Math.round(procH * scale);
+  if (!shareCanvas || shareCanvas.width !== w || shareCanvas.height !== h) {
+    shareCanvas = document.createElement('canvas');   // toDataURL needs a real canvas
+    shareCanvas.width = w;
+    shareCanvas.height = h;
+    shareCtx = shareCanvas.getContext('2d');
+  }
+  shareCtx.drawImage(frameCanvas, 0, 0, w, h);
+  const jpeg = shareCanvas.toDataURL('image/jpeg', SHARE_JPEG_QUALITY);
+  const detections = latestDetections.map(({ x, y, w: dw, h: dh, label, confidence, missed, trail }) => ({
+    x, y, w: dw, h: dh, label, confidence, missed,
+    trail: trail && trail.slice(-8).map(p => [Math.round(p[0]), Math.round(p[1])]),
+  }));
+  link.sendFrame(jpeg, detections, procW, procH);
+}
 
 function runYolo() {
   const token = sourceToken;
@@ -282,6 +347,7 @@ function runYolo() {
 }
 
 function processFrame() {
+  if (dashboardMode) return;
   const now = performance.now();
   const frame = getFrame();
   if (!frame) return;
@@ -293,7 +359,7 @@ function processFrame() {
   if (yoloDets.length && now - yoloTime > Math.max(YOLO_MIN_TTL_MS, detector.lastInferMs * 2.5)) {
     yoloDets = [];
   }
-  latestDetections = tracker.update(mergeDetections(yoloDets, motionBlobs));
+  latestDetections = tracker.update(mergeDetections(yoloDets, motionBlobs), motionEnabled ? motionDetector.shift : null, maskRegions(yoloDets));
 
   const elapsed = performance.now() - now;
   motionMs = motionMs === null ? elapsed : motionMs * 0.9 + elapsed * 0.1;
@@ -303,9 +369,10 @@ function processFrame() {
     runYolo();
   }
 
-  if (network.connected && network.role === 'source' && now - lastNetSend >= NET_SEND_INTERVAL_MS) {
-    lastNetSend = now;
-    network.sendDetections(latestDetections, procW, procH);
+  if (link?.connected && link.role === 'source' && now - lastShare >= SHARE_INTERVAL_MS &&
+      link.bufferedAmount < SHARE_MAX_BUFFERED) {
+    lastShare = now;
+    shareFrame();
   }
 
   framesInWindow++;
@@ -335,15 +402,6 @@ function scheduleFrame() {
 }
 
 // --- Stats ---
-function countByClass(detections) {
-  const counts = { insect: 0, drone: 0, bird: 0, unknown: 0 };
-  for (const d of detections) {
-    if (counts[d.label] !== undefined) counts[d.label]++;
-    else counts.unknown++;
-  }
-  return counts;
-}
-
 let fps = null;
 let fpsWindowStart = performance.now();
 
@@ -354,14 +412,16 @@ function updateStats() {
     framesInWindow = 0;
     fpsWindowStart = now;
   }
+  // On a dashboard the tiles add up every connected device.
+  const shown = dashboardMode ? dashboard.allDetections() : latestDetections;
   renderer.updateStats({
-    fps,
-    count: latestDetections.length,
+    fps: dashboardMode ? null : fps,
+    count: shown.length,
     backend: backendLabel,
     inferMs: detector.lastInferMs,
     motionMs,
     resolution: procW ? procW + '×' + procH : '',
-    classCounts: countByClass(latestDetections),
+    classCounts: countByClass(shown),
   });
 }
 
@@ -388,84 +448,191 @@ function captureFrame() {
   }, 'image/png');
 }
 
-// --- Networking ---
-const remoteSources = new Map();   // sourceId -> { name, summary }
+// --- Linking devices ---
+const remoteSources = new Map();   // sourceId -> name
+
+/** "Phone K7": a short tag keeps two phones apart on the dashboard. */
+function getDeviceName() {
+  const kind = IS_MOBILE ? 'Phone' : 'Computer';
+  let tag = '';
+  try { tag = localStorage.getItem('bugspotter-device-tag') || ''; } catch { /* storage unavailable */ }
+  if (!/^[A-Z0-9]{2}$/.test(tag)) {
+    tag = newRoomCode().slice(0, 2);
+    try { localStorage.setItem('bugspotter-device-tag', tag); } catch { /* keep it for this visit only */ }
+  }
+  return kind + ' ' + tag;
+}
+const deviceName = getDeviceName();
 
 function renderDeviceList() {
   deviceList.textContent = '';
-  for (const { name, summary } of remoteSources.values()) {
+  for (const name of remoteSources.values()) {
     const item = document.createElement('div');
     item.className = 'device-item';
     const dot = document.createElement('span');
     dot.className = 'device-dot connected';
-    item.append(dot, ' ' + name + (summary ? ' — ' + summary : ''));
+    item.append(dot, ' ' + name);
     deviceList.appendChild(item);
   }
 }
 
-function setupNetwork() {
-  // When the page is served by server.js the relay lives on the same host.
-  if (location.protocol === 'http:' && location.port) serverUrl.value = 'ws://' + location.host;
+/** Swap the local video for the grid of remote feeds, or back. */
+function setDashboardMode(on) {
+  if (dashboardMode === on) return;
+  dashboardMode = on;
+  document.body.classList.toggle('dashboard-mode', on);
+  dashboardEl.hidden = !on;
+  if (on) {
+    video.pause();              // this device only watches; no need to analyse its own video
+    resetPipeline();
+    hideStatus();
+  } else {
+    dashboard.clear();
+    if (video.currentSrc || video.srcObject) video.play().catch(() => {});
+  }
+}
 
-  const role = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'source';
+function joinLink() {
+  return location.origin + location.pathname + '?room=' + peerLink.room + (peerLink.broker ? '&peer=' + peerLink.broker : '');
+}
 
-  network.onStateChange = (state) => {
-    const connected = state === 'connected';
-    connectBtn.textContent = state === 'disconnected' ? 'Connect' : 'Disconnect';
-    connectionStatus.className = 'conn-status ' + (connected ? 'connected' : 'disconnected');
-    connectionStatus.textContent = {
-      disconnected: 'Disconnected',
-      connecting: 'Connecting…',
-      connected: 'Connected (' + role + ')',
-      reconnecting: 'Reconnecting…',
-    }[state];
-    if (!connected) {
-      remoteSources.clear();
-      renderDeviceList();
-    }
-    if (state !== 'connecting') {
-      log({
-        connected: 'Connected to server as ' + role,
-        reconnecting: 'No connection to server, retrying…',
-        disconnected: 'Disconnected from server',
-      }[state]);
-    }
-  };
+function updateLinkUi() {
+  const state = link ? link.state : 'disconnected';
+  const viaRoom = link === peerLink;
+  const role = link?.role;
+  const busy = state !== 'disconnected';
 
-  network.onSources = (sources) => {
-    const previous = new Map(remoteSources);
+  connectionStatus.className = 'conn-status ' + (state === 'connected' ? 'connected' : 'disconnected');
+  connectionStatus.textContent = {
+    disconnected: 'Not connected',
+    connecting: 'Connecting…',
+    connected: role === 'viewer' ? 'Dashboard open' : 'Sharing this device',
+    reconnecting: link?.detail ? link.detail + ' — retrying…' : 'Reconnecting…',
+  }[state];
+
+  joinBtn.textContent = busy && viaRoom && role === 'source' ? 'Stop sharing' : 'Share this device';
+  dashboardBtn.textContent = busy && viaRoom && role === 'viewer' ? 'Close dashboard' : 'Open a dashboard';
+  connectBtn.textContent = busy && !viaRoom ? 'Disconnect' : 'Connect';
+  joinBtn.disabled = busy && !(viaRoom && role === 'source');
+  dashboardBtn.disabled = busy && !(viaRoom && role === 'viewer');
+  connectBtn.disabled = busy && viaRoom;
+  roomInput.disabled = busy;
+  serverUrl.disabled = busy;
+
+  const hosting = busy && viaRoom && role === 'viewer';
+  roomInfo.hidden = !hosting;
+  if (hosting) roomCodeEl.textContent = peerLink.room;
+}
+
+let lastLoggedState = '';
+function onLinkState(state) {
+  if (!link) return;
+  const viewing = link.role === 'viewer';
+  if (state === 'connected' && viewing) {
+    setDashboardMode(true);
+    dashboard.setEmptyMessage(link === peerLink
+      ? 'No devices yet. On each phone open this page, enter room code ' + peerLink.room + ' and tap "Share this device".'
+      : 'Waiting for devices to connect to the relay…');
+  }
+  if (state === 'disconnected') {
+    setDashboardMode(false);
     remoteSources.clear();
-    for (const s of sources) {
-      remoteSources.set(s.id, { name: s.name, summary: previous.get(s.id)?.summary || '' });
-    }
     renderDeviceList();
-  };
+  }
 
-  network.onDetections = (sourceId, sourceName, detections) => {
-    const c = countByClass(detections);
-    const summary = detections.length + ' tracked (' + c.insect + ' insect, ' + c.drone + ' drone, ' + c.bird + ' bird)';
-    const entry = remoteSources.get(sourceId);
-    if (entry?.summary === summary) return;
-    remoteSources.set(sourceId, { name: sourceName, summary });
-    renderDeviceList();
-  };
+  const message = {
+    connecting: '',
+    connected: viewing ? (link === peerLink ? 'Dashboard open, room ' + peerLink.room : 'Connected to relay as viewer')
+      : (link === peerLink ? 'Sharing with room ' + peerLink.room : 'Connected to relay as source'),
+    reconnecting: link.detail || 'Connection lost, retrying…',
+    disconnected: link.detail || 'Disconnected',
+  }[state];
+  if (message && message !== lastLoggedState) log(message);
+  lastLoggedState = message;
+  updateLinkUi();
+}
 
-  connectBtn.addEventListener('click', () => {
-    if (network.state !== 'disconnected') {
-      network.disconnect();
+const linkActive = () => !!link && link.state !== 'disconnected';
+
+function startLink(which, target, role) {
+  link = which;
+  lastLoggedState = '';
+  try {
+    which.connect(target, role, deviceName);
+  } catch (e) {
+    link = null;
+    log(e.message);
+    updateLinkUi();
+    return false;
+  }
+  return true;
+}
+
+function stopLink() {
+  if (link) link.disconnect();
+  link = null;
+  updateLinkUi();
+}
+
+function setupLinks() {
+  for (const l of [peerLink, relayLink]) {
+    l.onStateChange = (state) => { if (l === link) onLinkState(state); };
+    l.onSources = (sources) => {
+      if (l !== link) return;
+      remoteSources.clear();
+      for (const s of sources) remoteSources.set(s.id, s.name);
+      renderDeviceList();
+      dashboard.setSources(sources);
+    };
+    l.onFrame = (id, name, jpeg, detections, width, height) => {
+      if (l === link) dashboard.showFrame(id, name, jpeg, detections, width, height);
+    };
+    l.onDetections = (id, name, detections, width, height) => {
+      if (l === link) dashboard.showFrame(id, name, null, detections, width, height);
+    };
+  }
+
+  // Room codes
+  joinBtn.addEventListener('click', () => {
+    if (linkActive()) { stopLink(); return; }
+    const code = normalizeRoomCode(roomInput.value);
+    if (!code) {
+      log('Enter the 6-character room code shown on the dashboard.');
+      roomInput.focus();
       return;
     }
-    const url = serverUrl.value.trim() || 'ws://localhost:8080';
+    roomInput.value = code;
+    startLink(peerLink, code, 'source');
+  });
+  roomInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinBtn.click(); });
+
+  dashboardBtn.addEventListener('click', () => {
+    if (linkActive()) { stopLink(); return; }
+    startLink(peerLink, newRoomCode(), 'viewer');
+  });
+
+  copyLinkBtn.addEventListener('click', async () => {
     try {
-      network.connect(url, role, navigator.userAgent.includes('Mobile') ? 'Phone' : 'Desktop');
-    } catch (e) {
-      log(e.message);
-      return;
-    }
-    if (location.protocol === 'https:' && url.startsWith('ws://') && !/^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(url)) {
-      log('Browsers block ws:// from an https:// page — use wss:// or open the app from the server itself.');
+      await navigator.clipboard.writeText(joinLink());
+      log('Phone link copied. Opening it on a phone joins this dashboard.');
+    } catch {
+      log('Phone link: ' + joinLink());
     }
   });
+
+  // Relay server (server.js). When the page is served by it, it is on the same host.
+  if (location.protocol === 'http:' && location.port) serverUrl.value = 'ws://' + location.host;
+  const relayRole = params.get('role') === 'viewer' ? 'viewer' : 'source';
+  connectBtn.addEventListener('click', () => {
+    if (linkActive()) { stopLink(); return; }
+    const url = serverUrl.value.trim() || 'ws://localhost:8080';
+    if (!startLink(relayLink, url, relayRole)) return;
+    if (location.protocol === 'https:' && url.startsWith('ws://') && !/^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(url)) {
+      log('Browsers block ws:// from an https:// page — use wss://, or use a room code instead.');
+    }
+  });
+
+  updateLinkUi();
 }
 
 // --- UI event handlers ---
@@ -525,7 +692,7 @@ captureBtn.addEventListener('click', captureFrame);
 document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;   // leave Ctrl+C etc. alone
   if (e.target.matches?.('input, select, textarea')) return;
-  if (e.code === 'KeyC') captureFrame();
+  if (e.code === 'KeyC' && !dashboardMode) captureFrame();
 });
 
 // Browsers that refuse autoplay need a gesture; any tap on the video will do.
@@ -559,10 +726,18 @@ async function loadModel() {
 function init() {
   applyConfidence();
   applyMotionSettings();
-  setupNetwork();
+  setupLinks();
 
-  // Start on a sample; never open the camera or a file dialog unprompted.
-  if (!SAMPLES[sourceSelect.value]) sourceSelect.value = DEFAULT_SOURCE;
+  const invitedRoom = normalizeRoomCode(params.get('room'));
+  if (invitedRoom) {
+    // Opened from a dashboard's phone link: use the camera and join right away.
+    roomInput.value = invitedRoom;
+    sourceSelect.value = 'camera';
+    startLink(peerLink, invitedRoom, 'source');
+  } else if (!SAMPLES[sourceSelect.value]) {
+    // Otherwise start on a sample; never open the camera or a file dialog unprompted.
+    sourceSelect.value = DEFAULT_SOURCE;
+  }
   uploadArea.classList.remove('visible');
   setSource(sourceSelect.value);
 

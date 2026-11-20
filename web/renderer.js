@@ -1,10 +1,10 @@
 // renderer.js — Polished canvas overlay for detection results
 
 const CLASS_COLORS = {
-  insect:  { stroke: '#FFD740', fill: 'rgba(255,215,64,', glow: '#FFD740' },
-  drone:   { stroke: '#FF5252', fill: 'rgba(255,82,82,',  glow: '#FF5252' },
-  bird:    { stroke: '#40C4FF', fill: 'rgba(64,196,255,',  glow: '#40C4FF' },
-  unknown: { stroke: '#FFD740', fill: 'rgba(255,215,64,', glow: '#FFD740' },
+  insect:  { stroke: '#FFD740', fill: 'rgba(255,215,64,' },
+  drone:   { stroke: '#FF5252', fill: 'rgba(255,82,82,' },
+  bird:    { stroke: '#40C4FF', fill: 'rgba(64,196,255,' },
+  unknown: { stroke: '#B0B0B0', fill: 'rgba(176,176,176,' },   // moving, but not classified
 };
 
 const STAT_IDS = [
@@ -18,9 +18,8 @@ export class Renderer {
     this.ctx = canvas.getContext('2d');
     this.width = 0;    // CSS pixels
     this.height = 0;
-    this._statEls = {};
+    this._statEls = null;   // looked up on first use; overlay-only renderers never need them
     this._statText = {};
-    for (const id of STAT_IDS) this._statEls[id] = document.getElementById(id);
   }
 
   /** Size the overlay in CSS pixels; the backing store follows devicePixelRatio. */
@@ -52,6 +51,22 @@ export class Renderer {
       const cy = y + h / 2;
       const area = w * h;
       const fadeAlpha = det.missed ? Math.max(0.1, 1 - det.missed * 0.05) : 1;
+
+      // --- Flight path: makes a fast, tiny target readable at a glance ---
+      if (det.trail && det.trail.length > 1) {
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = 'round';
+        const n = det.trail.length;
+        for (let i = 1; i < n; i++) {
+          ctx.globalAlpha = 0.6 * fadeAlpha * (i / n);   // older segments fade out
+          ctx.beginPath();
+          ctx.moveTo(det.trail[i - 1][0], det.trail[i - 1][1]);
+          ctx.lineTo(det.trail[i][0], det.trail[i][1]);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
 
       // --- Tiny detections: soft glow dot ---
       if (area < 225) {
@@ -164,6 +179,10 @@ export class Renderer {
 
   /** Update the sidebar. Only touches the DOM for values that changed. */
   updateStats(stats) {
+    if (!this._statEls) {
+      this._statEls = {};
+      for (const id of STAT_IDS) this._statEls[id] = document.getElementById(id);
+    }
     const set = (id, text) => {
       text = String(text);
       if (this._statText[id] === text) return;

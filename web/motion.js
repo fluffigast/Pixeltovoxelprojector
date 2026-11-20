@@ -24,6 +24,11 @@ const CELL = 1 << CELL_SHIFT;   // 32 px; activity / cluster map resolution
 export class MotionDetector {
   constructor(options = {}) {
     this.threshold = options.threshold ?? 20;
+    // Per-cell adaptive threshold: max(threshold, clutterK × the cell's recent
+    // mean residual). Patches that flicker every frame (foliage, water,
+    // screens) raise their own floor; quiet sky stays at `threshold`.
+    this.clutterK = options.clutterK ?? 6;
+    this.clutterSmoothing = options.clutterSmoothing ?? 0.25;
     this.minArea = options.minArea ?? 3;
     this.maxArea = options.maxArea ?? 40000;      // a close drone can be 200 px across
     this.maxSide = options.maxSide ?? 320;        // px; larger blobs are scenery
@@ -55,7 +60,7 @@ export class MotionDetector {
     //  - Cluster veto: a cell (with its 8 neighbours) holding more than
     //    clusterMax blobs this frame is texture, not targets.
     this.bgTexMax = options.bgTexMax ?? 8;
-    this.bgTexRatio = options.bgTexRatio ?? 0.15;
+    this.bgTexRatio = options.bgTexRatio ?? 0.3;
     this.activityDecay = options.activityDecay ?? 0.9;
     this.activityMax = options.activityMax ?? 1.0;   // 1.0 = off; 0.35 trades some recall near foliage for fewer false blobs
     this.clusterMax = options.clusterMax ?? 3;
@@ -78,8 +83,11 @@ export class MotionDetector {
 
   setThreshold(v) { this.threshold = v; }
 
+  /** Camera shift (prev → cur) estimated on the last frame. */
+  get shift() { return this.lastShift; }
+
   /** Forget history (call when the video source changes). */
-  reset() { this._count = 0; this._s1.dx = this._s1.dy = this._s2.dx = this._s2.dy = 0; if (this._activity) this._activity.fill(0); }
+  reset() { this._count = 0; this._s1.dx = this._s1.dy = this._s2.dx = this._s2.dy = 0; if (this._activity) { this._activity.fill(0); this._clutter.fill(0); } }
 
   _allocLabels(cap) {
     const grow = (old, Type) => { const a = new Type(cap); if (old) a.set(old); return a; };
@@ -103,6 +111,10 @@ export class MotionDetector {
     this._cellHits = new Uint16Array(this._cw * this._ch);
     this._cellNow = new Uint8Array(this._cw * this._ch);
     this._texHist = new Uint32Array(256);
+    this._clutter = new Float32Array(this._cw * this._ch);   // EMA of mean residual per cell
+    this._cellSum = new Uint32Array(this._cw * this._ch);
+    this._cellN = new Uint32Array(this._cw * this._ch);
+    this._cellThr = new Int32Array(this._cw * this._ch);
     // Pyramid levels for shift estimation (box-averaged).
     this._w4 = w >> 2; this._h4 = h >> 2;
     this._w16 = w >> 4; this._h16 = h >> 4;
@@ -240,18 +252,25 @@ export class MotionDetector {
     const t = this.threshold, eg = this.edgeGrad, ek = this.edgeK;
     const labels = this._labels;
     labels.fill(0);
+    const cwc = this._cw, clutter = this._clutter, cellSum = this._cellSum, cellN = this._cellN, cellThr = this._cellThr;
+    const kc = this.clutterK;
+    for (let c = 0; c < cellThr.length; c++) { const v = kc * clutter[c]; cellThr[c] = v > t ? v | 0 : t; }
+    cellSum.fill(0); cellN.fill(0);
     let parent = this._parent, area = this._area, sum = this._sum;
     let minX = this._minX, maxX = this._maxX, minY = this._minY, maxY = this._maxY;
     let next = 1, motionPixels = 0;
 
     for (let y = y0; y < y1; y++) {
       let i = y * w + x0;
+      const cellRow = (y >> CELL_SHIFT) * cwc;
       for (let x = x0; x < x1; x++, i++) {
         const c = cur[i];
         let a = c - prev1[i + off1]; if (a < 0) a = -a;
-        if (a <= t) continue;
         let b = c - prev2[i + off2]; if (b < 0) b = -b;
-        if (b <= t) continue;
+        const cell = cellRow + (x >> CELL_SHIFT);
+        const dmin = a < b ? a : b;
+        cellSum[cell] += dmin; cellN[cell]++;
+        if (dmin <= cellThr[cell]) continue;
 
         // Static-edge test: strong gradient here in both cur and aligned prev1,
         // and the residual is no bigger than misalignment alone would explain.
@@ -296,6 +315,11 @@ export class MotionDetector {
       }
     }
 
+    // Update the per-cell clutter level from this frame's mean residual.
+    const sm = this.clutterSmoothing;
+    for (let c = 0; c < clutter.length; c++) {
+      if (cellN[c]) clutter[c] += (cellSum[c] / cellN[c] - clutter[c]) * sm;
+    }
     this.lastMotionFraction = motionPixels / n;
     if (motionPixels > n * this.maxMotionFraction) return [];
 

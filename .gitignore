@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+web/node_modules/
+
+# OS
+.DS_Store
+
+# Third-party test data (nested git clone, 80MB)
+test_data/
+
+# Rust build output (wasm is inlined into web/artifact.html)
+wasm-detector/target/

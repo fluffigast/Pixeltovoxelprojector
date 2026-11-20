@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """Headless demo of video to voxel conversion."""
 
 import numpy as np

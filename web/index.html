@@ -286,12 +286,13 @@
       <!-- Controls bar -->
       <div class="controls">
         <select id="sourceSelect" aria-label="Video source" autocomplete="off">
-          <option value="sample-new">Sample: New Video</option>
-          <option value="sample-insect" selected>Sample: Insects</option>
-          <option value="sample-drone">Sample: Drone</option>
-          <option value="sample-bees">Sample: Bees at Hive</option>
-          <option value="sample-dronesky">Sample: Drone in Sky</option>
-          <option value="sample-faa">Sample: FAA Drone</option>
+          <option value="sample-fixed" selected>Sample: Window, fixed camera</option>
+          <option value="sample-new">Sample: Window, hand-held</option>
+          <option value="sample-new2">Sample: Window 2, hand-held</option>
+          <option value="sample-insect">Sample: Insects in forest</option>
+          <option value="sample-dronex">Sample: Drone crossing sky</option>
+          <option value="sample-drone">Sample: Drone (camera follows)</option>
+          <option value="sample-bees">Sample: Bees at hive</option>
           <option value="camera">Camera</option>
           <option value="upload">Upload File</option>
         </select>
@@ -396,7 +397,7 @@
 
   <footer class="footer-stats">
     <span>BugSpotter v2.0</span>
-    <span>Motion: 2-frame diff + connected components</span>
+    <span>Motion: shake-compensated 3-frame diff + static-edge veto + confirmed tracks</span>
     <span>Press C to capture frame</span>
   </footer>
 

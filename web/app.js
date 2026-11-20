@@ -9,14 +9,15 @@ import { createCanvas } from './util.js';
 
 // --- Configuration ---
 const MODEL_URL = 'models/yolov11n.onnx';
-const DEFAULT_SOURCE = 'sample-insect';
+const DEFAULT_SOURCE = 'sample-fixed';
 const SAMPLES = {
-  'sample-new': 'samples/new_video.mp4',
+  'sample-fixed': 'samples/new_video_fixed.mp4',    // window + sky, stabilised to mimic a fixed camera
+  'sample-new': 'samples/new_video.mp4',            // same scene, hand-held
+  'sample-new2': 'samples/new_video2.mp4',          // hand-held, textured background (hard case)
   'sample-insect': 'samples/insects_flying_forest.mp4',
-  'sample-drone': 'samples/drone_flying_sky.mp4',
+  'sample-dronex': 'samples/drone_crossing_sky.mp4', // fixed camera, drone crosses the frame
+  'sample-drone': 'samples/drone_flying_sky.mp4',   // camera pans with the drone: YOLO only, no frame motion
   'sample-bees': 'samples/bees_hive.mp4',
-  'sample-dronesky': 'samples/drone_in_sky.mp4',
-  'sample-faa': 'samples/drone_spotted.mp4',
 };
 
 // COCO has no drone or insect class. These are the classes YOLO tends to

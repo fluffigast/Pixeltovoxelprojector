@@ -7,6 +7,9 @@ const CLASS_COLORS = {
   unknown: { stroke: '#B0B0B0', fill: 'rgba(176,176,176,' },   // moving, but not classified
 };
 
+// CSS px. Smallest ring drawn around a detection: about a fingertip on a phone.
+const MIN_RING_RADIUS = 12;
+
 const STAT_IDS = [
   'fpsDisplay', 'countDisplay', 'insectCount', 'droneCount', 'birdCount',
   'inferDisplay', 'backendDisplay', 'motionMsDisplay', 'resolutionDisplay',
@@ -68,49 +71,26 @@ export class Renderer {
         ctx.globalAlpha = 1;
       }
 
-      // --- Tiny detections: soft glow dot ---
-      if (area < 225) {
-        // Outer glow
-        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 10);
-        grad.addColorStop(0, colors.fill + (0.5 * fadeAlpha) + ')');
-        grad.addColorStop(1, colors.fill + '0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, 10, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Core dot
-        ctx.globalAlpha = 0.9 * fadeAlpha;
-        ctx.fillStyle = colors.stroke;
-        ctx.beginPath();
-        ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        continue;
-      }
-
-      // --- Small detections: ring with glow ---
+      // --- Small detections: a ring big enough to find on a phone screen ---
+      // A fly is often only a few screen pixels across; the mark must not be.
+      // Dark halo under the coloured ring so it reads on bright sky as well as
+      // on dark foliage.
       if (area < 1600) {
-        const r = Math.max(w, h) / 2 + 5;
-
-        // Glow behind ring
-        const grad = ctx.createRadialGradient(cx, cy, r - 3, cx, cy, r + 6);
-        grad.addColorStop(0, colors.fill + (0.15 * fadeAlpha) + ')');
-        grad.addColorStop(1, colors.fill + '0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r + 6, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Ring
-        ctx.globalAlpha = 0.8 * fadeAlpha;
-        ctx.strokeStyle = colors.stroke;
-        ctx.lineWidth = 1.5;
+        const r = Math.max(MIN_RING_RADIUS, Math.max(w, h) / 2 + 5);
+        ctx.globalAlpha = 0.55 * fadeAlpha;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 4;
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Center dot
+        ctx.globalAlpha = 0.95 * fadeAlpha;
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+
         ctx.fillStyle = colors.stroke;
         ctx.beginPath();
         ctx.arc(cx, cy, 2, 0, Math.PI * 2);

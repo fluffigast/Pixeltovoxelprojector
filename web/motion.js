@@ -17,9 +17,12 @@
 //   5. Shake gate: if the shift is huge or too much of the frame still moves
 //      after alignment, the frame is unusable; report nothing.
 
+import { SlowMoverDetector } from './slow.js';
+
 const INITIAL_LABELS = 4096;
 const CELL_SHIFT = 5;
 const CELL = 1 << CELL_SHIFT;   // 32 px; activity / cluster map resolution
+const ZERO_SHIFT = { dx: 0, dy: 0 };
 
 export class MotionDetector {
   constructor(options = {}) {
@@ -70,6 +73,12 @@ export class MotionDetector {
     // that fails the fill-ratio test instead of looking like many targets.
     this.mergeGap = options.mergeGap ?? 12;
 
+    // Slow movers (a fly walking on glass) are invisible to the one-frame
+    // baseline above; slow.js finds them with a long temporal baseline and
+    // reports each as one more blob (flagged `slow`). `slow: false` turns it off.
+    this.slow = (options.slow ?? true) ? new SlowMoverDetector(options) : null;
+    this.slowDedupe = options.slowDedupe ?? 6;      // px around a slow object's box in which fast blobs are the same object
+
     this.lastShift = { dx: 0, dy: 0 };
     this.lastMotionFraction = 0;
 
@@ -81,13 +90,17 @@ export class MotionDetector {
     this._allocLabels(INITIAL_LABELS);
   }
 
-  setThreshold(v) { this.threshold = v; }
+  setThreshold(v) { this.threshold = v; if (this.slow) this.slow.setThreshold(v); }
 
   /** Camera shift (prev → cur) estimated on the last frame. */
   get shift() { return this.lastShift; }
 
   /** Forget history (call when the video source changes). */
-  reset() { this._count = 0; this._s1.dx = this._s1.dy = this._s2.dx = this._s2.dy = 0; if (this._activity) { this._activity.fill(0); this._clutter.fill(0); } }
+  reset() {
+    this._count = 0; this._s1.dx = this._s1.dy = this._s2.dx = this._s2.dy = 0;
+    if (this._activity) { this._activity.fill(0); this._clutter.fill(0); }
+    if (this.slow) this.slow.reset();
+  }
 
   _allocLabels(cap) {
     const grow = (old, Type) => { const a = new Type(cap); if (old) a.set(old); return a; };
@@ -209,6 +222,26 @@ export class MotionDetector {
    * @returns {Array<{x,y,w,h,area,label,confidence,source}>} blobs, largest first
    */
   update(imageData) {
+    this._cut = false;
+    const fast = this._fast(imageData);
+    if (!this.slow) return fast;
+    const still = this._count < 3 ? ZERO_SHIFT : this.lastShift;
+    const slow = this.slow.update(this._frames[0], this._w, this._h, still, this._cut);
+    if (!slow.length) return fast;
+    // A slow object that also shows in the one-frame residual is one object.
+    const g = this.slowDedupe;
+    const out = slow.slice();
+    for (const b of fast) {
+      const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+      let dup = false;
+      for (const s of slow) if (cx >= s.x - g && cx <= s.x + s.w + g && cy >= s.y - g && cy <= s.y + s.h + g) { dup = true; break; }
+      if (!dup) out.push(b);
+    }
+    return out;
+  }
+
+  // One-frame-baseline residual (fast movers).
+  _fast(imageData) {
     const { data, width: w, height: h } = imageData;
     this._ensureBuffers(w, h);
     const n = this._n;
@@ -239,7 +272,7 @@ export class MotionDetector {
       this._s1.dx = this._s1.dy = 0;
     }
     this.lastShift = { dx: this._s1.dx, dy: this._s1.dy };
-    if (Math.abs(this._s1.dx) > this.maxShift || Math.abs(this._s1.dy) > this.maxShift) return [];
+    if (Math.abs(this._s1.dx) > this.maxShift || Math.abs(this._s1.dy) > this.maxShift) { this._cut = true; return []; }
 
     const dx1 = this._s1.dx, dy1 = this._s1.dy;
     const dx2 = dx1 + this._s2.dx, dy2 = dy1 + this._s2.dy;

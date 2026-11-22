@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="text-scale" content="scale">
+  <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+  <script>
+    // Trusted Types default policy: only same-origin, blob:, the pinned ORT build
+    // (ORT's worker) and the pinned PeerJS build (room codes, peer.js) may become
+    // script URLs; HTML and script strings are refused.
+    if (window.trustedTypes?.createPolicy) {
+      trustedTypes.createPolicy('default', {
+        createScriptURL(url) {
+          const u = new URL(url, location.href);
+          if (u.origin === location.origin || u.protocol === 'blob:' ||
+              u.href.startsWith('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/') ||
+              u.href === 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js') return url;
+          throw new TypeError('Blocked script URL: ' + u.href);
+        },
+        createScript() { throw new TypeError('Blocked script string'); },   // ORT probes eval('require'); refusing is harmless
+        createHTML() { throw new TypeError('Blocked HTML string'); },
+      });
+    }
+  </script>
+  <link rel="icon" href="data:,">
+  <title>BugSpotter - Drone &amp; Insect Detector</title>
+  <style>
+    /* Targeted resets only: no `*` rules, so components and layers can still override. */
+    :where(html, body, h1, h2, p, dl, dd, ul) { margin: 0; padding: 0; }
+    :where(html) { box-sizing: border-box; }
+    :where(body, header, main, aside, footer, div, section, dl, ul, li, canvas, video, input, select, button, progress, output) { box-sizing: inherit; }
+    :where(ul) { list-style: none; }
+    [hidden] { display: none !important; }
+    :focus-visible { outline: 2px solid #81C784; outline-offset: 2px; }
+
+    :root {
+      /* Dark-only design: native controls, scrollbars and the canvas follow it. */
+      color-scheme: dark;
+      --accent: #4CAF50;
+      --accent-strong: #2E7D32;
+      --accent-soft: #81C784;
+      --muted: #999;
+      --field-bg: #2a2a2a;
+      --field-border: #555;
+      accent-color: var(--accent);
+      --target-size: 24px;
+      @media (pointer: coarse) { --target-size: 44px; }
+    }
+    /* WCAG 2.5.8 / 2.5.5 target sizes for the input method in use. */
+    :where(button, select, input:not([type="checkbox"], [type="radio"], [type="range"]), label:has(input[type="checkbox"])) {
+      min-block-size: var(--target-size);
+      min-inline-size: var(--target-size);
+    }
+    :where(input[type="range"]) { min-block-size: var(--target-size); }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #1a3a1a, #0d1f0d);
+      min-height: 100vh;
+      min-height: 100dvh;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* --- Header --- */
+    .header {
+      text-align: center;
+      padding: 16px 16px 8px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+    }
+    .header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.5px; text-wrap: balance; }
+    .header p { font-size: 0.85rem; opacity: 0.85; margin-top: 2px; text-wrap: pretty; }
+
+    /* --- Main layout --- */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    /* em-based breakpoints follow OS text scaling. */
+    @media (min-width: 56.3125em) {
+      /* Fixed-height app shell: the video scales to fit instead of growing the page. */
+      body { height: 100vh; height: 100dvh; }
+      .main { min-height: 0; }
+    }
+    @media (max-width: 56.25em) {
+      .main { flex-direction: column; overflow: visible; }
+    }
+
+    /* --- Left column: video --- */
+    .col-video {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    /* --- Controls bar --- */
+    .controls {
+      display: flex;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(0,0,0,0.4);
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .controls select {
+      background: var(--field-bg);
+      color: #eee;
+      border: 1px solid var(--field-border);
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 0.8125rem;
+    }
+    .controls label { font-size: 0.75rem; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
+    .controls input[type="file"] { display: none; }
+    .ctrl-group { display: flex; align-items: center; gap: 6px; }
+    .controls output { min-inline-size: 2.5em; font-variant-numeric: tabular-nums; }
+    input[type="checkbox"][switch] { margin: 0; cursor: pointer; }
+    input[type="checkbox"][switch]:focus-visible { outline: 3px solid var(--accent-soft); outline-offset: 4px; }
+    .control-hints {
+      font-size: 0.75rem;
+      color: var(--muted);
+      padding: 0 12px 6px;
+      background: rgba(0,0,0,0.4);
+      text-wrap: pretty;
+    }
+
+    /* --- Upload area (shown when upload selected) --- */
+    .upload-area {
+      border: 2px dashed var(--accent);
+      border-radius: 12px;
+      padding: 30px;
+      text-align: center;
+      margin: 12px;
+      background: rgba(76,175,80,0.05);
+      transition: background-color 0.2s, border-color 0.2s;
+      display: none;
+    }
+    .upload-area.visible { display: block; }
+    .upload-area.dragover { background: rgba(76,175,80,0.15); border-color: var(--accent-soft); }
+    .upload-area p { margin: 8px 0; color: #aaa; font-size: 0.9rem; }
+    .upload-area .upload-hint { font-size: 0.8rem; color: var(--muted); }
+    .upload-btn {
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      color: white;
+      border: none;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* Hover / press feedback for every button. */
+    @media (hover: hover) {
+      :where(.upload-btn, .btn-sm, #retryBtn, #playBtn):hover { filter: brightness(1.12); }
+    }
+    :where(.upload-btn, .btn-sm, #retryBtn, #playBtn):active { filter: brightness(0.9); translate: 0 1px; }
+
+    /* --- Video view --- */
+    #view {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      background: #000;
+      min-height: 300px;
+    }
+    #videoElement { width: 100%; height: 100%; object-fit: contain; }
+    @media (max-width: 56.25em) {
+      /* Stacked layout: the view takes the video's own height, capped. */
+      #view { flex: none; min-height: 200px; }
+      #videoElement { height: auto; max-height: 70vh; max-height: 70dvh; }
+    }
+    #overlayCanvas { position: absolute; pointer-events: none; }
+
+    #status {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1rem;
+      text-align: center;
+      z-index: 10;
+      display: grid;
+      justify-items: center;
+      gap: 8px;
+    }
+    #status:not([hidden]) {
+      background: rgba(0,0,0,0.6);
+      padding: 12px 18px;
+      border-radius: 10px;
+    }
+    #playBtn {
+      background: var(--accent); color: #fff; border: none; border-radius: 6px;
+      padding: 6px 18px; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    }
+
+    /* --- Loading spinner: native indeterminate <progress> --- */
+    progress.loading-spinner:indeterminate::-webkit-progress-bar { display: none; background: none; }
+    progress.loading-spinner:indeterminate::-webkit-progress-value { display: none; background: none; }
+    progress.loading-spinner:indeterminate::-moz-progress-bar { display: none; background: none; }
+    progress.loading-spinner:indeterminate::slider-fill { display: none; background: none; }
+    @property --arc-start { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+    @property --arc-end { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+    @property --progress-dash-animation { syntax: "*"; inherits: false; initial-value: , progress-dash 3s ease-in-out infinite; }
+    progress.loading-spinner:indeterminate {
+      --_from: calc(90deg + var(--arc-start, 0deg));
+      --_to: calc(90deg + var(--arc-end, 158deg));
+      --size: 24px;
+      --thickness: 3px;
+      --spinner-color: var(--accent);
+      --track-color: #555;
+      --spinner-duration: 1.5s;
+      --_used-spinner-duration: var(--spinner-duration);
+      position: relative;
+      width: var(--size);
+      height: var(--size);
+      border-radius: 50%;
+      appearance: none;
+      background: conic-gradient(from var(--_from), var(--spinner-color) calc(var(--_to) - var(--_from)), transparent 0) var(--track-color);
+      @supports (background-clip: border-area) {
+        background-clip: border-area;
+        border: var(--thickness) solid transparent;
+        background-origin: border-box;
+      }
+      @supports not (background-clip: border-area) {
+        --clip-boundary: calc(100% - var(--thickness));
+        mask-image: radial-gradient(farthest-side, transparent var(--clip-boundary), black var(--clip-boundary));
+        border: 0;
+      }
+      @media (forced-colors: active) {
+        forced-color-adjust: none;
+        --spinner-color: CanvasText;
+        --track-color: Canvas;
+      }
+      animation: progress-spin var(--_used-spinner-duration) linear infinite var(--progress-dash-animation, );
+    }
+    @keyframes progress-spin { to { rotate: 1turn; } }
+    @keyframes progress-dash {
+      from { --arc-start: 0deg; --arc-end: 3deg; }
+      50% { --arc-start: 100deg; --arc-end: 358deg; }
+      to { --arc-start: 360deg; --arc-end: 363deg; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      progress.loading-spinner:indeterminate {
+        --_used-spinner-duration: 6s;
+        --progress-dash-animation: ;
+        --arc-end: 158deg;
+      }
+    }
+
+    #retryBtn {
+      background: #c33; color: #fff; border: none; border-radius: 4px;
+      padding: 2px 10px; font-size: 0.75rem; cursor: pointer; margin-left: 8px;
+    }
+
+    /* --- Right sidebar --- */
+    .sidebar {
+      width: 20rem;
+      display: flex;
+      flex-direction: column;
+      background: rgba(0,0,0,0.3);
+      overflow-y: auto;
+    }
+    @media (max-width: 56.25em) {
+      .sidebar { width: 100%; overflow-y: visible; }
+    }
+
+    .card {
+      background: rgba(255,255,255,0.06);
+      border-radius: 12px;
+      padding: 14px;
+      margin: 8px;
+    }
+    .card h2 {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+
+    /* --- Stats grid (description list: label + value pairs) --- */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-item {
+      display: flex;
+      flex-direction: column-reverse;   /* value above label visually; DOM keeps dt before dd */
+      text-align: center;
+      padding: 10px 6px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+    }
+    .stat-item.stat-warn { background: rgba(255,136,0,0.15); }
+    .stat-value { font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat-label { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+
+    /* Class-specific stat colors */
+    .stat-insect .stat-value { color: #FFCC00; }
+    .stat-drone .stat-value { color: #FF3333; }
+    .stat-bird .stat-value { color: #00DDFF; }
+
+    /* --- Pipeline settings --- */
+    .setting-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 0.85rem;
+    }
+    .setting-val { min-width: 30px; text-align: right; color: var(--accent); font-weight: 600; font-size: 0.85rem; }
+
+    /* --- Network panel --- */
+    .conn-status {
+      font-size: 0.8rem;
+      padding: 2px 8px;
+      border-radius: 10px;
+      display: inline-block;
+    }
+    .conn-status.connected { background: rgba(76,175,80,0.3); color: var(--accent-soft); }
+    .conn-status.disconnected { background: rgba(255,255,255,0.1); color: var(--muted); }
+    .network-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+    .network-row input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      background: var(--field-bg);
+      color: #eee;
+      border: 1px solid var(--field-border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-size: 0.75rem;
+    }
+    .lna-help { font-size: 0.8rem; color: #ffb74d; margin-top: 8px; text-wrap: pretty; }
+    .btn-sm {
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 5px 12px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-sm:disabled { background: #3a4a3a; color: #889; cursor: default; }
+    .btn-wide { flex: 1; padding: 7px 12px; }
+    .network-row input:disabled { opacity: 0.6; }
+    .hint { font-size: 0.75rem; color: #9a9a9a; line-height: 1.4; margin-bottom: 8px; }
+    .hint code { color: #c5e1a5; }
+    .room-info {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(76,175,80,0.12); border-radius: 8px;
+      padding: 8px 10px; margin-bottom: 8px; font-size: 0.8rem;
+    }
+    .room-info strong { font: 700 1.3rem ui-monospace, monospace; letter-spacing: 3px; color: #fff; flex: 1; }
+    .relay { margin-top: 10px; font-size: 0.8rem; color: #aaa; }
+    .relay summary { cursor: pointer; margin-bottom: 8px; }
+
+    /* --- Dashboard: feeds from other devices, shown in place of the local video --- */
+    .dashboard {
+      position: absolute; inset: 0; z-index: 20;
+      background: #0b0f0b;
+      overflow-y: auto;
+      padding: 10px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      align-content: start;
+    }
+    .dashboard-empty { grid-column: 1 / -1; color: #9a9a9a; text-align: center; padding: 48px 16px; line-height: 1.5; }
+    .feed { background: #000; border-radius: 10px; overflow: hidden; border: 1px solid #263226; }
+    .feed.stale { opacity: 0.45; }
+    .feed-picture { position: relative; min-height: 120px; }
+    .feed-picture img { display: block; width: 100%; height: auto; }
+    .feed-picture canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .feed figcaption { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 0.8rem; background: #111811; }
+    .feed-name { font-weight: 600; }
+    .feed-summary { color: #FFD740; }
+    body.dashboard-mode .controls { opacity: 0.4; pointer-events: none; }
+    .device-list { margin-top: 8px; }
+    .device-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 0;
+      font-size: 0.8rem;
+      color: #ccc;
+    }
+    .device-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .device-dot.connected { background: var(--accent); }
+    .device-dot.disconnected { background: #666; }
+
+    /* --- Activity log --- */
+    .log {
+      background: rgba(0,0,0,0.3);
+      border-radius: 8px;
+      padding: 8px;
+      max-height: 10rem;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 0.75rem;
+      line-height: 1.5;
+    }
+    .log-entry { margin-bottom: 2px; }
+    .log-time { color: #888; }
+
+    /* --- Footer stats bar --- */
+    .footer-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 16px;
+      padding: 6px 12px;
+      background: rgba(0,0,0,0.5);
+      font-size: 0.75rem;
+      font-family: monospace;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>BugSpotter</h1>
+    <p>AI-Powered Drone &amp; Insect Detection</p>
+  </header>
+
+  <main class="main">
+    <!-- Left: Video + Controls -->
+    <div class="col-video">
+      <!-- Controls bar -->
+      <div class="controls">
+        <select id="sourceSelect" aria-label="Video source">
+          <option value="sample-fixed" selected>Sample: Window, fixed camera</option>
+          <option value="sample-new">Sample: Window, hand-held</option>
+          <option value="sample-new2">Sample: Window 2, hand-held</option>
+          <option value="sample-insect">Sample: Insects in forest</option>
+          <option value="sample-dronex">Sample: Drone crossing sky</option>
+          <option value="sample-drone">Sample: Drone (camera follows)</option>
+          <option value="sample-bees">Sample: Bees at hive</option>
+          <option value="camera">Camera</option>
+          <option value="upload">Upload File</option>
+        </select>
+        <input type="file" id="fileInput" accept="video/*">
+
+        <div class="ctrl-group">
+          <label for="confSlider">Conf:</label>
+          <input type="range" id="confSlider" min="5" max="95" value="25" step="5" aria-describedby="hintConf" aria-valuetext="0.25">
+          <output id="confValue" for="confSlider">0.25</output>
+        </div>
+        <div class="ctrl-group">
+          <label>Motion <input type="checkbox" id="motionToggle" switch checked></label>
+          <label for="motionSlider">Threshold:</label>
+          <input type="range" id="motionSlider" min="5" max="60" value="20" aria-describedby="hintThreshold">
+          <output id="motionValue" for="motionSlider">20</output>
+        </div>
+        <button type="button" class="btn-sm" id="captureBtn" aria-describedby="hintCapture" aria-keyshortcuts="C">Capture</button>
+      </div>
+      <p class="control-hints">
+        <span id="hintConf">Conf: minimum YOLO confidence.</span>
+        <span id="hintThreshold">Threshold: brightness change that counts as motion, lower is more sensitive.</span>
+        <span id="hintCapture">Capture saves the frame with its overlay (key C).</span>
+      </p>
+
+      <!-- Upload area (hidden by default) -->
+      <div class="upload-area" id="uploadArea">
+        <p>Drag &amp; drop a video file here</p>
+        <p class="upload-hint">Supports MP4, WebM, MOV</p>
+        <button type="button" class="upload-btn" id="chooseFileBtn">Choose File</button>
+      </div>
+
+      <!-- Video view -->
+      <div id="view">
+        <video id="videoElement" playsinline muted loop aria-label="Analysed video"></video>
+        <canvas id="overlayCanvas" aria-hidden="true"></canvas>
+        <div id="dashboard" class="dashboard" hidden></div>
+        <div id="status">
+          <progress class="loading-spinner" aria-label="Loading"></progress>
+          <span id="statusText" role="status">Loading video...</span>
+          <button type="button" id="playBtn" hidden>Play</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right sidebar -->
+    <aside class="sidebar">
+      <!-- Detection counts -->
+      <div class="card">
+        <h2>Detections</h2>
+        <dl class="stats-grid">
+          <div class="stat-item"><dt class="stat-label">Total</dt><dd class="stat-value" id="countDisplay">0</dd></div>
+          <div class="stat-item"><dt class="stat-label">FPS</dt><dd class="stat-value" id="fpsDisplay">--</dd></div>
+          <div class="stat-item stat-insect"><dt class="stat-label">Insects</dt><dd class="stat-value" id="insectCount">0</dd></div>
+          <div class="stat-item stat-drone"><dt class="stat-label">Drones</dt><dd class="stat-value" id="droneCount">0</dd></div>
+          <div class="stat-item stat-bird"><dt class="stat-label">Birds</dt><dd class="stat-value" id="birdCount">0</dd></div>
+          <div class="stat-item"><dt class="stat-label">YOLO infer</dt><dd class="stat-value" id="inferDisplay">--</dd></div>
+        </dl>
+      </div>
+
+      <!-- Settings -->
+      <div class="card">
+        <h2>Pipeline</h2>
+        <div class="setting-row">
+          <span>Backend</span>
+          <span><span class="setting-val" id="backendDisplay">--</span><button type="button" id="retryBtn" hidden>Retry</button></span>
+        </div>
+        <div class="setting-row">
+          <span>Analysis size</span>
+          <span class="setting-val" id="resolutionDisplay">--</span>
+        </div>
+        <div class="setting-row">
+          <span>Motion pass</span>
+          <span class="setting-val" id="motionMsDisplay">--</span>
+        </div>
+      </div>
+
+      <!-- Linking devices -->
+      <div class="card">
+        <h2>Multi-Device</h2>
+        <p class="hint">Watch several phones on one screen. Open a dashboard on one device, then enter its room code on each phone.</p>
+        <div class="network-row">
+          <input type="text" id="roomInput" placeholder="Room code" maxlength="8" aria-label="Room code" spellcheck="false" autocapitalize="characters" autocomplete="off">
+          <button type="button" class="btn-sm" id="joinBtn">Share this device</button>
+        </div>
+        <div class="network-row">
+          <button type="button" class="btn-sm btn-wide" id="dashboardBtn">Open a dashboard</button>
+        </div>
+        <div id="roomInfo" class="room-info" hidden>
+          <span>Room code</span>
+          <strong id="roomCode"></strong>
+          <button type="button" class="btn-sm" id="copyLinkBtn">Copy phone link</button>
+        </div>
+        <span class="conn-status disconnected" id="connectionStatus" role="status">Not connected</span>
+        <ul class="device-list" id="deviceList" aria-label="Connected devices"></ul>
+        <details class="relay">
+          <summary>Use your own relay server instead</summary>
+          <div class="network-row">
+            <input type="text" id="serverUrl" value="ws://localhost:8080" placeholder="ws://server:port" aria-label="Relay server URL" spellcheck="false" autocapitalize="off">
+            <button type="button" class="btn-sm" id="connectBtn">Connect</button>
+          </div>
+          <p class="lna-help" id="lnaHelp" hidden></p>
+          <p class="hint">Run <code>node server.js</code>; open the page with <code>?role=viewer</code> for the dashboard.</p>
+        </details>
+      </div>
+
+      <!-- Activity log -->
+      <div class="card">
+        <h2>Activity Log</h2>
+        <div class="log" id="activityLog"></div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="footer-stats">
+    <span>BugSpotter v2.0</span>
+    <span>Motion: shake-compensated 3-frame diff, clutter-adaptive threshold, confirmed tracks</span>
+    <span>Press C to capture frame</span>
+  </footer>
+
+  <script async fetchpriority="low" id="ortScript" onerror="this.dataset.state='error'" src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"
+          integrity="sha384-l/kzpOl2DEfJXExKcb3MxVpF46L+SrAoPHyOUj5yfJ1/b0UjsuMEsnlwf6mtVbCh"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

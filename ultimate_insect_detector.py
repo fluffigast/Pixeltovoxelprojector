@@ -11,468 +11,320 @@ from collections import deque, defaultdict
 from typing import List, Tuple, Dict, Optional
 
 class UltimateInsectDetector:
-    """Ultimate insect detection system optimized for outdoor flying insects."""
-    
+    """Flying object detection using ego-motion-compensated frame differencing.
+
+    Single-pass detection on downsampled frames. Estimates camera motion via
+    sparse optical flow, warps previous frame to compensate, then detects
+    only independently-moving objects in the residual.
+
+    Inspired by TrackCraft3r: work in compressed space, single forward pass.
+    """
+
     def __init__(self):
-        # Ultra-specific parameters for flying insects
-        self.min_area = 1           # Single pixels for distant insects
-        self.max_area = 150         # Larger for close insects/moths
-        self.min_perimeter = 3
-        
-        # Shape filtering optimized for insects
-        self.min_aspect_ratio = 0.1
-        self.max_aspect_ratio = 10.0
-        self.min_solidity = 0.15    # Very loose for irregular insect shapes
-        self.min_extent = 0.1
-        
-        # Motion parameters - ultra-sensitive
-        self.motion_threshold = 4
-        self.gaussian_blur = 1      # Preserve tiny details
-        
-        # Multiple background subtractors for different scenarios
-        self.bg_mog2 = cv2.createBackgroundSubtractorMOG2(
-            history=50,         # Quick adaptation for outdoor scenes
-            varThreshold=3,     # Ultra-sensitive
-            detectShadows=False
-        )
-        
-        self.bg_knn = cv2.createBackgroundSubtractorKNN(
-            history=50,
-            dist2Threshold=100,
-            detectShadows=False
-        )
-        
-        # Frame differencing buffers
-        self.frame_buffer = deque(maxlen=4)
+        # Detection parameters
+        self.min_area = 2
+        self.max_area = 500
+        self.min_perimeter = 4
+        self.motion_threshold = 20
+
+        # Downsampling factor for detection (work at 1/4 resolution)
+        self.detect_scale = 0.25
+
+        # Frame buffer for differencing
+        self.prev_gray_full = None      # full-res for ego-motion estimation
+        self.prev_gray_small = None     # downsampled for detection
         self.processed_frames = 0
-        
+
         # Tracking with prediction
         self.tracks = {}
         self.next_track_id = 0
-        
+        self.max_tracks = 50
+
         # Insect behavior patterns
-        self.min_speed = 1.5        # Very slow insects
-        self.max_speed = 80.0       # Very fast insects
-        self.erratic_threshold = 25 # Direction change degrees
-        self.hover_frames = 8       # Frames to detect hovering
-        
+        self.min_speed = 1.5
+        self.max_speed = 80.0
+        self.erratic_threshold = 25
+        self.hover_frames = 8
+
         # Adaptive thresholding
         self.adaptive_enabled = True
-        self.recent_detection_counts = deque(maxlen=60)  # 2 seconds at 30fps
-        self.target_detections_per_second = 8
-        
+        self.recent_detection_counts = deque(maxlen=60)
+        self.target_detections_per_second = 5
+
+        # Ego-motion state
+        self.camera_moving = False
+        self.warp_matrix = None
+
     def detect_flying_insects(self, frame: np.ndarray) -> List[Dict]:
-        """Comprehensive flying insect detection."""
-        detections = []
+        """Single-pass compensated detection."""
         self.processed_frames += 1
-        
-        # Method 1: Dual background subtraction
-        bg_detections = self._detect_dual_background_subtraction(frame)
-        detections.extend(bg_detections)
-        
-        # Method 2: Enhanced frame differencing
-        if len(self.frame_buffer) >= 2:
-            diff_detections = self._detect_enhanced_frame_difference(frame)
-            detections.extend(diff_detections)
-        
-        # Method 3: Motion blob detection
-        motion_detections = self._detect_motion_blobs(frame)
-        detections.extend(motion_detections)
-        
-        # Method 4: Edge-based detection for fast insects
-        edge_detections = self._detect_edge_motion(frame)
-        detections.extend(edge_detections)
-        
-        # Add frame to buffer
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.frame_buffer.append(gray)
-        
-        # Merge and filter detections
-        final_detections = self._merge_filter_detections(detections, frame)
-        
-        # Adaptive parameter adjustment
+
+        # Full-res grayscale for ego-motion estimation
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Downsampled for detection (compressed space)
+        h, w = frame.shape[:2]
+        small_w = int(w * self.detect_scale)
+        small_h = int(h * self.detect_scale)
+        gray_small = cv2.resize(gray_full, (small_w, small_h))
+        gray_small = cv2.GaussianBlur(gray_small, (3, 3), 0)
+
+        detections = []
+
+        if self.prev_gray_full is not None and self.prev_gray_small is not None:
+            # Estimate ego-motion from full-res (more features)
+            self.warp_matrix = self._estimate_ego_motion(self.prev_gray_full, gray_full)
+
+            # Compensate and detect on downsampled (fast)
+            detections = self._detect_compensated(gray_small, self.prev_gray_small,
+                                                   small_w, small_h, w, h)
+
+        self.prev_gray_full = gray_full
+        self.prev_gray_small = gray_small
+
+        # Quality filter
+        detections = self._filter_detections(detections, frame)
+
         if self.adaptive_enabled:
-            self._adapt_sensitivity(len(final_detections))
-        
-        return final_detections
-    
-    def _detect_dual_background_subtraction(self, frame: np.ndarray) -> List[Dict]:
-        """Dual background subtraction for robust detection."""
-        detections = []
-        
-        # MOG2 - good for regular backgrounds
-        fg_mog2 = self.bg_mog2.apply(frame)
-        
-        # KNN - good for complex backgrounds
-        fg_knn = self.bg_knn.apply(frame)
-        
-        # Combine masks with OR operation
-        combined_fg = cv2.bitwise_or(fg_mog2, fg_knn)
-        
-        # Noise reduction while preserving small objects
+            self._adapt_sensitivity(len(detections))
+
+        return detections
+
+    def _estimate_ego_motion(self, prev_gray: np.ndarray, curr_gray: np.ndarray) -> Optional[np.ndarray]:
+        """Estimate camera motion as 2x3 affine via sparse optical flow."""
+        features = cv2.goodFeaturesToTrack(prev_gray, maxCorners=200, qualityLevel=0.01,
+                                           minDistance=30, blockSize=7)
+        if features is None or len(features) < 8:
+            self.camera_moving = False
+            return None
+
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, features, None,
+            winSize=(21, 21), maxLevel=3)
+
+        if new_pts is None:
+            self.camera_moving = False
+            return None
+
+        good = status.flatten() == 1
+        if np.sum(good) < 6:
+            self.camera_moving = False
+            return None
+
+        matrix, inliers = cv2.estimateAffinePartial2D(
+            features[good], new_pts[good],
+            method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+        if matrix is None:
+            self.camera_moving = False
+            return None
+
+        tx, ty = matrix[0, 2], matrix[1, 2]
+        self.camera_moving = math.sqrt(tx*tx + ty*ty) > 1.5
+        return matrix
+
+    def _detect_compensated(self, curr_small: np.ndarray, prev_small: np.ndarray,
+                             sw: int, sh: int, fw: int, fh: int) -> List[Dict]:
+        """Ego-motion-compensated frame differencing on downsampled frames.
+
+        Single method replaces the four redundant detection passes.
+        """
+        # Warp previous frame to align with current (compensate camera motion)
+        if self.warp_matrix is not None:
+            # Scale the affine matrix for the downsampled resolution
+            scale_matrix = self.warp_matrix.copy()
+            scale_matrix[0, 2] *= self.detect_scale
+            scale_matrix[1, 2] *= self.detect_scale
+            aligned_prev = cv2.warpAffine(prev_small, scale_matrix, (sw, sh),
+                                           borderMode=cv2.BORDER_REFLECT)
+        else:
+            aligned_prev = prev_small
+
+        # Frame difference — only independently-moving objects survive
+        diff = cv2.absdiff(curr_small, aligned_prev)
+
+        # Adaptive threshold: mean + 2*std eliminates residual noise from
+        # imperfect compensation (parallax, rolling shutter, etc.)
+        mean_val = np.mean(diff)
+        std_val = np.std(diff)
+        threshold = max(self.motion_threshold, mean_val + 2.0 * std_val)
+        _, thresh = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+        # Morphology to clean up
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        combined_fg = cv2.morphologyEx(combined_fg, cv2.MORPH_OPEN, kernel, iterations=1)
-        combined_fg = cv2.morphologyEx(combined_fg, cv2.MORPH_CLOSE, kernel, iterations=1)
-        
-        # Find contours
-        contours, _ = cv2.findContours(combined_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            detection = self._analyze_insect_contour(contour, 'background_dual')
-            if detection:
-                detections.append(detection)
-        
-        return detections
-    
-    def _detect_enhanced_frame_difference(self, frame: np.ndarray) -> List[Dict]:
-        """Enhanced frame differencing for fast-moving insects."""
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        # Find contours in downsampled space
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Scale detections back to full resolution
+        scale_inv = 1.0 / self.detect_scale
         detections = []
-        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        current_gray = cv2.GaussianBlur(current_gray, (self.gaussian_blur, self.gaussian_blur), 0)
-        
-        # Compare with multiple previous frames
-        for i, prev_gray in enumerate(list(self.frame_buffer)[-3:]):
-            weight = 1.0 / (i + 1)  # Recent frames weighted more
-            
-            # Frame difference
-            diff = cv2.absdiff(current_gray, prev_gray)
-            
-            # Adaptive threshold based on image content
-            mean_intensity = np.mean(diff)
-            std_intensity = np.std(diff)
-            adaptive_threshold = max(self.motion_threshold, mean_intensity + 0.5 * std_intensity)
-            
-            _, thresh = cv2.threshold(diff, adaptive_threshold, 255, cv2.THRESH_BINARY)
-            
-            # Minimal morphology to connect nearby pixels
-            kernel = np.ones((2, 2), np.uint8)
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            
-            # Find contours
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                detection = self._analyze_insect_contour(contour, f'frame_diff_{i}')
-                if detection:
-                    detection['weight'] = weight
-                    detections.append(detection)
-        
-        return detections
-    
-    def _detect_motion_blobs(self, frame: np.ndarray) -> List[Dict]:
-        """Detect motion blobs for medium-sized insects."""
-        if len(self.frame_buffer) < 1:
-            return []
-        
-        detections = []
-        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        prev_gray = self.frame_buffer[-1]
-        
-        # Absolute difference
-        diff = cv2.absdiff(current_gray, prev_gray)
-        
-        # Apply median filter to reduce noise
-        diff = cv2.medianBlur(diff, 3)
-        
-        # Dynamic threshold based on image statistics
-        threshold = max(self.motion_threshold, np.percentile(diff, 95) * 0.3)
-        _, motion_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
-        
-        # Find contours
-        contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         for contour in contours:
-            detection = self._analyze_insect_contour(contour, 'motion_blob')
-            if detection:
-                detections.append(detection)
-        
-        return detections
-    
-    def _detect_edge_motion(self, frame: np.ndarray) -> List[Dict]:
-        """Detect fast insects using edge information."""
-        if len(self.frame_buffer) < 1:
-            return []
-        
-        detections = []
-        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        prev_gray = self.frame_buffer[-1]
-        
-        # Calculate edges
-        current_edges = cv2.Canny(current_gray, 30, 100)
-        prev_edges = cv2.Canny(prev_gray, 30, 100)
-        
-        # Edge difference
-        edge_diff = cv2.absdiff(current_edges, prev_edges)
-        
-        # Dilate to connect nearby edge changes
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        edge_diff = cv2.dilate(edge_diff, kernel, iterations=1)
-        
-        # Find contours in edge differences
-        contours, _ = cv2.findContours(edge_diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            detection = self._analyze_insect_contour(contour, 'edge_motion')
-            if detection:
-                detections.append(detection)
-        
-        return detections
-    
-    def _analyze_insect_contour(self, contour, method: str) -> Optional[Dict]:
-        """Analyze contour to determine if it's an insect."""
-        if len(contour) < 3:
-            return None
-        
-        # Basic measurements
-        area = cv2.contourArea(contour)
-        if area < self.min_area or area > self.max_area:
-            return None
-        
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter < self.min_perimeter:
-            return None
-        
-        # Bounding rectangle
-        x, y, w, h = cv2.boundingRect(contour)
-        center_x, center_y = x + w // 2, y + h // 2
-        
-        # Aspect ratio check
-        aspect_ratio = w / h if h > 0 else 0
-        if not (self.min_aspect_ratio <= aspect_ratio <= self.max_aspect_ratio):
-            return None
-        
-        # Solidity (how solid vs. sparse the shape is)
-        hull = cv2.convexHull(contour)
-        hull_area = cv2.contourArea(hull)
-        solidity = area / hull_area if hull_area > 0 else 0
-        if solidity < self.min_solidity:
-            return None
-        
-        # Extent (how much of bounding box is filled)
-        extent = area / (w * h) if w * h > 0 else 0
-        if extent < self.min_extent:
-            return None
-        
-        # Additional insect-specific features
-        compactness = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
-        
-        # Eccentricity for elongated insects
-        if len(contour) >= 5:
-            try:
-                ellipse = cv2.fitEllipse(contour)
-                major_axis = max(ellipse[1])
-                minor_axis = min(ellipse[1])
-                eccentricity = np.sqrt(1 - (minor_axis / major_axis)**2) if major_axis > 0 else 0
-            except:
-                eccentricity = 0
-        else:
-            eccentricity = 0
-        
-        return {
-            'center': (center_x, center_y),
-            'bbox': (x, y, w, h),
-            'area': area,
-            'perimeter': perimeter,
-            'aspect_ratio': aspect_ratio,
-            'solidity': solidity,
-            'extent': extent,
-            'compactness': compactness,
-            'eccentricity': eccentricity,
-            'contour': contour,
-            'method': method,
-            'timestamp': self.processed_frames
-        }
-    
-    def _merge_filter_detections(self, detections: List[Dict], frame: np.ndarray) -> List[Dict]:
-        """Merge nearby detections and apply final filtering."""
-        if not detections:
-            return []
-        
-        # Group nearby detections
-        merged_detections = []
-        used_indices = set()
-        
-        for i, det in enumerate(detections):
-            if i in used_indices:
+            if len(contour) < 3:
                 continue
-            
-            # Find nearby detections (within 10 pixels)
-            nearby_detections = [det]
-            center_i = det['center']
-            
-            for j, other_det in enumerate(detections):
-                if j <= i or j in used_indices:
-                    continue
-                
-                center_j = other_det['center']
-                distance = math.sqrt((center_i[0] - center_j[0])**2 + (center_i[1] - center_j[1])**2)
-                
-                if distance < 10:
-                    nearby_detections.append(other_det)
-                    used_indices.add(j)
-            
-            # Merge if multiple detections found
-            if len(nearby_detections) > 1:
-                merged = self._merge_nearby_detections(nearby_detections)
-                merged_detections.append(merged)
-            else:
-                merged_detections.append(det)
-            
-            used_indices.add(i)
-        
-        # Apply final quality filters
-        final_detections = []
-        for detection in merged_detections:
-            if self._passes_quality_filter(detection, frame):
-                final_detections.append(detection)
-        
-        return final_detections
-    
-    def _merge_nearby_detections(self, detections: List[Dict]) -> Dict:
-        """Merge multiple nearby detections."""
-        # Weight by area for center calculation
-        total_area = sum(det['area'] for det in detections)
-        
-        if total_area > 0:
-            center_x = sum(det['center'][0] * det['area'] for det in detections) / total_area
-            center_y = sum(det['center'][1] * det['area'] for det in detections) / total_area
-        else:
-            center_x = np.mean([det['center'][0] for det in detections])
-            center_y = np.mean([det['center'][1] for det in detections])
-        
-        # Take best properties from largest detection
-        largest_det = max(detections, key=lambda d: d['area'])
-        
-        merged = largest_det.copy()
-        merged['center'] = (int(center_x), int(center_y))
-        merged['area'] = total_area
-        merged['method'] = 'merged'
-        merged['merge_count'] = len(detections)
-        
-        return merged
-    
-    def _passes_quality_filter(self, detection: Dict, frame: np.ndarray) -> bool:
-        """Apply final quality filtering."""
-        # Size constraints
-        area = detection['area']
-        if area < 1 or area > 200:
-            return False
-        
-        # Shape constraints
-        if detection['compactness'] < 0.05 or detection['compactness'] > 1.2:
-            return False
-        
-        # Boundary check
-        center_x, center_y = detection['center']
-        if center_x < 5 or center_y < 5 or center_x >= frame.shape[1] - 5 or center_y >= frame.shape[0] - 5:
-            return False
-        
-        # Intensity analysis in detection area
-        x, y, w, h = detection['bbox']
-        
-        # Ensure valid ROI
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
-        
-        if x2 <= x1 or y2 <= y1:
-            return False
-        
-        roi = frame[y1:y2, x1:x2]
-        if roi.size == 0:
-            return False
-        
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # Check for sufficient contrast
-        intensity_range = np.max(gray_roi) - np.min(gray_roi)
-        if intensity_range < 10:  # Too uniform
-            return False
-        
-        return True
-    
+
+            area_small = cv2.contourArea(contour)
+            area_full = area_small * scale_inv * scale_inv
+
+            if area_full < self.min_area or area_full > self.max_area:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(contour)
+            # Scale bbox to full resolution
+            fx = int(x * scale_inv)
+            fy = int(y * scale_inv)
+            fbw = int(bw * scale_inv)
+            fbh = int(bh * scale_inv)
+            center_x = fx + fbw // 2
+            center_y = fy + fbh // 2
+
+            perimeter = cv2.arcLength(contour, True) * scale_inv
+            if perimeter < self.min_perimeter:
+                continue
+
+            aspect_ratio = fbw / fbh if fbh > 0 else 0
+            if aspect_ratio < 0.1 or aspect_ratio > 10.0:
+                continue
+
+            compactness = 4 * np.pi * area_full / (perimeter * perimeter) if perimeter > 0 else 0
+
+            detections.append({
+                'center': (center_x, center_y),
+                'bbox': (fx, fy, fbw, fbh),
+                'area': area_full,
+                'perimeter': perimeter,
+                'aspect_ratio': aspect_ratio,
+                'compactness': compactness,
+                'method': 'compensated',
+                'timestamp': self.processed_frames
+            })
+
+        # Cap detections
+        if len(detections) > 30:
+            detections.sort(key=lambda d: d['area'], reverse=True)
+            detections = detections[:30]
+
+        return detections
+
+    def _filter_detections(self, detections: List[Dict], frame: np.ndarray) -> List[Dict]:
+        """Quality filter on full-resolution frame."""
+        h, w = frame.shape[:2]
+        filtered = []
+        for det in detections:
+            cx, cy = det['center']
+            if cx < 5 or cy < 5 or cx >= w - 5 or cy >= h - 5:
+                continue
+            if det['compactness'] < 0.05 or det['compactness'] > 1.2:
+                continue
+
+            # Contrast check on full-res ROI
+            x, y, bw, bh = det['bbox']
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(w, x + bw), min(h, y + bh)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            roi = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+            if roi.size == 0 or np.ptp(roi) < 10:
+                continue
+
+            filtered.append(det)
+        return filtered
+
     def _adapt_sensitivity(self, current_detections: int):
         """Adapt detection sensitivity based on recent performance."""
         self.recent_detection_counts.append(current_detections)
-        
-        if len(self.recent_detection_counts) >= 30:  # 1 second of data
+
+        if len(self.recent_detection_counts) >= 30:
             recent_avg = np.mean(list(self.recent_detection_counts)[-30:])
-            
-            # Too many detections - reduce sensitivity
+
             if recent_avg > self.target_detections_per_second * 2:
-                self.motion_threshold = min(15, self.motion_threshold + 1)
-                self.min_area = min(8, self.min_area + 1)
-            
-            # Too few detections - increase sensitivity
+                self.motion_threshold = min(50, self.motion_threshold + 2)
+                self.min_area = min(20, self.min_area + 1)
+
             elif recent_avg < self.target_detections_per_second * 0.3:
-                self.motion_threshold = max(2, self.motion_threshold - 1)
-                self.min_area = max(1, self.min_area - 1)
+                self.motion_threshold = max(8, self.motion_threshold - 1)
+                self.min_area = max(2, self.min_area - 1)
     
     def update_tracks_with_prediction(self, detections: List[Dict]) -> List[Dict]:
-        """Update tracks with simple prediction."""
-        # Simple tracking without Kalman filter
+        """Prediction-first tracking.
+
+        For each track, predict where it should be (from velocity), then search
+        only near that prediction. Like temporal RoPE alignment: tell the matcher
+        where to look before it searches.
+        """
         updated_tracks = {}
         assigned_detections = set()
-        
-        # Update existing tracks
+
+        # Build predictions for all tracks
+        predictions = {}
         for track_id, track in self.tracks.items():
-            best_detection = None
-            best_distance = float('inf')
-            best_idx = -1
-            
-            # Predict next position based on velocity
-            if len(track['positions']) >= 2:
-                last_pos = track['positions'][-1]
-                prev_pos = track['positions'][-2]
-                velocity = (last_pos[0] - prev_pos[0], last_pos[1] - prev_pos[1])
-                predicted_pos = (last_pos[0] + velocity[0], last_pos[1] + velocity[1])
+            positions = track['positions']
+            if len(positions) >= 4:
+                # Quadratic fit on last 6 points
+                recent = positions[-min(6, len(positions)):]
+                t = np.arange(len(recent), dtype=np.float64)
+                px = np.polyfit(t, [p[0] for p in recent], deg=2)
+                py = np.polyfit(t, [p[1] for p in recent], deg=2)
+                next_t = float(len(recent))
+                predictions[track_id] = (np.polyval(px, next_t), np.polyval(py, next_t))
+            elif len(positions) >= 2:
+                last, prev = positions[-1], positions[-2]
+                predictions[track_id] = (2*last[0] - prev[0], 2*last[1] - prev[1])
             else:
-                predicted_pos = track['last_center']
-            
-            # Find closest detection to prediction
-            for i, detection in enumerate(detections):
-                if i in assigned_detections:
-                    continue
-                
-                det_center = detection['center']
-                distance = math.sqrt((det_center[0] - predicted_pos[0])**2 + 
-                                   (det_center[1] - predicted_pos[1])**2)
-                
-                # Dynamic search radius based on track speed
-                search_radius = min(40, max(15, track.get('speed', 5) * 2))
-                
-                if distance < best_distance and distance < search_radius:
-                    best_distance = distance
-                    best_detection = detection
-                    best_idx = i
-            
-            if best_detection:
-                # Update track
-                track['positions'].append(best_detection['center'])
-                track['last_center'] = best_detection['center']
-                track['lost_frames'] = 0
-                track['detection'] = best_detection
-                track['age'] += 1
-                
-                # Analyze behavior
-                self._analyze_insect_behavior(track)
-                
+                predictions[track_id] = track['last_center']
+
+        # Score all (track, detection) pairs — only near predictions
+        scores = []
+        for track_id, pred in predictions.items():
+            track = self.tracks[track_id]
+            search_radius = min(50, max(15, track.get('speed', 5) * 3))
+            for i, det in enumerate(detections):
+                cx, cy = det['center']
+                dist = math.sqrt((cx - pred[0])**2 + (cy - pred[1])**2)
+                if dist < search_radius:
+                    score = 1.0 - dist / search_radius
+                    scores.append((score, track_id, i))
+
+        # Greedy assign highest scores first
+        scores.sort(reverse=True)
+        assigned_tracks = set()
+        for score, track_id, det_idx in scores:
+            if track_id in assigned_tracks or det_idx in assigned_detections:
+                continue
+            track = self.tracks[track_id]
+            det = detections[det_idx]
+            track['positions'].append(det['center'])
+            track['last_center'] = det['center']
+            track['lost_frames'] = 0
+            track['detection'] = det
+            track['age'] += 1
+            self._analyze_insect_behavior(track)
+            updated_tracks[track_id] = track
+            assigned_tracks.add(track_id)
+            assigned_detections.add(det_idx)
+
+        # Unmatched tracks: keep briefly with prediction
+        for track_id, track in self.tracks.items():
+            if track_id in assigned_tracks:
+                continue
+            track['lost_frames'] += 1
+            if track['lost_frames'] < 15:  # Longer persistence via prediction
+                pred = predictions[track_id]
+                track['positions'].append((pred[0], pred[1]))
+                track['last_center'] = (pred[0], pred[1])
                 updated_tracks[track_id] = track
-                assigned_detections.add(best_idx)
-            else:
-                # Track lost
-                track['lost_frames'] += 1
-                if track['lost_frames'] < 8:  # Keep lost tracks briefly
-                    updated_tracks[track_id] = track
-        
-        # Create new tracks
-        for i, detection in enumerate(detections):
-            if i not in assigned_detections:
+
+        # New tracks for unmatched detections (under cap)
+        for i, det in enumerate(detections):
+            if i not in assigned_detections and len(updated_tracks) < self.max_tracks:
                 new_track = {
                     'id': self.next_track_id,
-                    'positions': [detection['center']],
-                    'last_center': detection['center'],
+                    'positions': [det['center']],
+                    'last_center': det['center'],
                     'lost_frames': 0,
-                    'detection': detection,
+                    'detection': det,
                     'age': 1,
                     'speed': 0,
                     'direction_changes': 0,
@@ -483,12 +335,11 @@ class UltimateInsectDetector:
                 }
                 updated_tracks[self.next_track_id] = new_track
                 self.next_track_id += 1
-        
+
         self.tracks = updated_tracks
-        
-        # Return active tracks with reasonable confidence
-        return [track for track in self.tracks.values() 
-                if track['lost_frames'] == 0 and track['confidence'] > 0.3]
+
+        return [t for t in self.tracks.values()
+                if t['lost_frames'] == 0 and t['confidence'] > 0.3]
     
     def _analyze_insect_behavior(self, track: Dict):
         """Analyze track for insect-like behavior patterns."""
@@ -602,7 +453,7 @@ class UltimateInsectTracker:
         self.voxel_size = 0.01  # Very fine voxels
         self.insect_voxels = np.zeros(self.voxel_dims, dtype=np.float32)
         self.voxel_colors = np.zeros((*self.voxel_dims, 3), dtype=np.float32)
-        self.voxel_decay = 0.91  # Quick decay for dynamic scenes
+        self.voxel_decay = 0.75  # Fast decay — voxels fade in ~10 frames
         
         # Camera parameters
         self.camera_fov = 80  # Wide field of view for outdoor scenes
@@ -789,24 +640,11 @@ class UltimateInsectTracker:
                 else:
                     color = np.array([0.0, 1.0, 0.0])  # Green - normal
                 
-                intensity = track['confidence'] * 2.0
-                
-                # High-resolution voxel update with fine spreading
-                spread_radius = max(1, int(track['confidence'] * 2))
-                for dx in range(-spread_radius, spread_radius + 1):
-                    for dy in range(-spread_radius, spread_radius + 1):
-                        for dz in range(-1, 2):
-                            nvx, nvy, nvz = vx + dx, vy + dy, vz + dz
-                            if (0 <= nvx < self.voxel_dims[0] and 
-                                0 <= nvy < self.voxel_dims[1] and 
-                                0 <= nvz < self.voxel_dims[2]):
-                                
-                                distance = math.sqrt(dx*dx + dy*dy + dz*dz)
-                                falloff = max(0.1, 1.0 / (1.0 + distance * 0.5))
-                                
-                                update_amount = intensity * falloff
-                                self.insect_voxels[nvx, nvy, nvz] += update_amount
-                                self.voxel_colors[nvx, nvy, nvz] += color * update_amount
+                intensity = track['confidence']
+
+                # Single voxel per detection — no spreading
+                self.insect_voxels[vx, vy, vz] += intensity
+                self.voxel_colors[vx, vy, vz] += color * intensity
                                 
     def _create_ultimate_visualization(self, frame: np.ndarray, detections: List[Dict], tracks: List[Dict]) -> np.ndarray:
         """Create ultimate visualization."""
@@ -931,18 +769,9 @@ class UltimateInsectTracker:
                     screen_y = int((-world_y / (distance * fov_scale) + 1) * self.height / 2)
                     
                     if 0 <= screen_x < self.width and 0 <= screen_y < self.height:
-                        # Ultra-fine voxel rendering
-                        size = max(1, int(5 * intensity / distance))
+                        size = max(1, min(3, int(2 * intensity / distance)))
                         bgr_color = tuple(map(int, color[::-1] * 255))
-                        
-                        # Multi-layer glow effect
-                        for r in range(size + 3, 0, -1):
-                            alpha = 0.2 * (r / (size + 3)) * intensity
-                            glow_color = tuple(int(c * alpha) for c in bgr_color)
-                            cv2.circle(frame, (screen_x, screen_y), r, glow_color, -1)
-                        
-                        # Bright core
-                        cv2.circle(frame, (screen_x, screen_y), max(1, size), bgr_color, -1)
+                        cv2.circle(frame, (screen_x, screen_y), size, bgr_color, -1)
                         
     def _add_ultimate_stats(self, frame: np.ndarray, detections: List[Dict], tracks: List[Dict]):
         """Add comprehensive statistics display."""

@@ -37,7 +37,9 @@ const view = $('view');
 const overlay = $('overlayCanvas');
 const statusEl = $('status');
 const statusText = $('statusText');
-const statusSpinner = statusEl.querySelector('.spinner');
+const statusSpinner = statusEl.querySelector('.loading-spinner');
+const playBtn = $('playBtn');
+const lnaHelp = $('lnaHelp');
 const retryBtn = $('retryBtn');
 const sourceSelect = $('sourceSelect');
 const fileInput = $('fileInput');
@@ -63,9 +65,10 @@ const renderer = new Renderer(overlay);
 const network = new Network();
 
 // --- Status display ---
-function showStatus(msg, { spinner = false } = {}) {
+function showStatus(msg, { spinner = false, play = false } = {}) {
   statusText.textContent = msg;
   statusSpinner.hidden = !spinner;
+  playBtn.hidden = !play;
   statusEl.hidden = false;
 }
 function hideStatus() {
@@ -174,7 +177,7 @@ async function setSource(source, file) {
       showStatus(cameraErrorMessage(e) + ' Use a sample video or upload a file.');
       log('Camera unavailable: ' + (e?.message || e));
     } else if (e?.name === 'NotAllowedError') {
-      showStatus('Tap the video to start playback.');
+      showStatus('Playback needs a tap or key press.', { play: true });
     } else {
       showStatus('Could not load video. Try a different file.');
       log('Video failed to load: ' + (e?.message || e));
@@ -394,13 +397,51 @@ const remoteSources = new Map();   // sourceId -> { name, summary }
 function renderDeviceList() {
   deviceList.textContent = '';
   for (const { name, summary } of remoteSources.values()) {
-    const item = document.createElement('div');
+    const item = document.createElement('li');
     item.className = 'device-item';
     const dot = document.createElement('span');
     dot.className = 'device-dot connected';
     item.append(dot, ' ' + name + (summary ? ' — ' + summary : ''));
     deviceList.appendChild(item);
   }
+}
+
+// --- Local Network Access (Chrome): ws:// to localhost / LAN from an https page ---
+const PRIVATE_V4 = [/^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./];
+/** 'loopback-network' | 'local-network' | null (public host) for a ws(s):// URL. */
+function addressSpaceFor(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
+  host = host.replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '::1') return 'loopback-network';
+  if (host.endsWith('.local') || PRIVATE_V4.some(r => r.test(host)) || /^(fc|fd|fe80)/.test(host)) return 'local-network';
+  return null;
+}
+
+/** Permission state for the address space, or 'unsupported'. Never queries the legacy combined name. */
+async function lnaPermission(space) {
+  if (!space || !navigator.permissions?.query) return 'unsupported';
+  try {
+    const status = await navigator.permissions.query({ name: space });
+    status.onchange = () => showLnaHelp(space, status.state);
+    return status.state;
+  } catch {
+    return 'unsupported';   // browser without Local Network Access permissions
+  }
+}
+
+function showLnaHelp(space, state) {
+  lnaHelp.hidden = state !== 'denied';
+  if (state === 'denied') {
+    lnaHelp.textContent = 'This site is blocked from ' + (space === 'loopback-network' ? 'apps on this device' : 'devices on your local network') +
+      '. Allow "Local network access" for this site in the browser\'s site settings, then press Connect again.';
+  }
+}
+
+/** Coarse form factor via UA Client Hints or feature detection, not UA-string sniffing. */
+function deviceKind() {
+  const mobile = navigator.userAgentData?.mobile ?? matchMedia('(pointer: coarse)').matches;
+  return mobile ? 'Phone' : 'Desktop';
 }
 
 function setupNetwork() {
@@ -450,20 +491,26 @@ function setupNetwork() {
     renderDeviceList();
   };
 
-  connectBtn.addEventListener('click', () => {
+  // Connecting only ever starts from this click, so a Local Network Access
+  // prompt is tied to a user gesture and never fires on page load.
+  connectBtn.addEventListener('click', async () => {
     if (network.state !== 'disconnected') {
       network.disconnect();
       return;
     }
     const url = serverUrl.value.trim() || 'ws://localhost:8080';
+    const space = addressSpaceFor(url);
+    const state = await lnaPermission(space);
+    showLnaHelp(space, state);
+    if (state === 'denied') { log('Local network access denied for ' + url); return; }
     try {
-      network.connect(url, role, navigator.userAgent.includes('Mobile') ? 'Phone' : 'Desktop');
+      network.connect(url, role, deviceKind());
     } catch (e) {
-      log(e.message);
+      log(e.message + (e.cause ? ' (' + e.cause.message + ')' : ''));
       return;
     }
-    if (location.protocol === 'https:' && url.startsWith('ws://') && !/^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(url)) {
-      log('Browsers block ws:// from an https:// page — use wss:// or open the app from the server itself.');
+    if (location.protocol === 'https:' && url.startsWith('ws://') && !space) {
+      log('Browsers block ws:// to a public host from an https:// page — use wss://.');
     }
   });
 }
@@ -506,6 +553,7 @@ for (const target of [uploadArea, view]) {
 function applyConfidence() {
   const v = Number(confSlider.value) / 100;
   confValue.textContent = v.toFixed(2);
+  confSlider.setAttribute('aria-valuetext', v.toFixed(2));
   detector.setConfidenceThreshold(v);
 }
 confSlider.addEventListener('input', applyConfidence);
@@ -528,12 +576,15 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyC') captureFrame();
 });
 
-// Browsers that refuse autoplay need a gesture; any tap on the video will do.
-view.addEventListener('click', () => {
+// Browsers that refuse autoplay need a gesture: a tap on the video, or the
+// Play button for keyboard and switch users.
+function resumePlayback() {
   if (video.paused && (video.currentSrc || video.srcObject)) {
     video.play().then(hideStatus).catch(() => {});
   }
-});
+}
+view.addEventListener('click', resumePlayback);
+playBtn.addEventListener('click', (e) => { e.stopPropagation(); resumePlayback(); });
 
 retryBtn.addEventListener('click', loadModel);
 

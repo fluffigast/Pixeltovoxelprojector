@@ -43,7 +43,7 @@ export class Renderer {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.width, this.height);
 
-    const sorted = [...detections].sort((a, b) => (a.w * a.h) - (b.w * b.h));
+    const sorted = detections.toSorted((a, b) => (a.w * a.h) - (b.w * b.h));
 
     for (const det of sorted) {
       const colors = CLASS_COLORS[det.label] || CLASS_COLORS.unknown;

@@ -3,138 +3,156 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Motion Detector (WASM)</title>
+<meta name="color-scheme" content="dark" />
+<meta name="text-scale" content="scale" />
+<link rel="icon" href="data:,">
+  <title>Motion Detector (WASM)</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { margin: 0; padding: 0; height: 100%; background: #0a0f0a; color: #d6ffd6; font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .wrap { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  :root { --target-size: 24px; accent-color: #4a7a4a; }
+  @media (pointer: coarse) { :root { --target-size: 44px; } }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a0f0a; color: #d6ffd6; }
+  body { font: 0.875rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  :where(button, select, input[type=text]) { min-block-size: var(--target-size); }
+  :where(input[type=range]) { min-block-size: var(--target-size); }
+  .stats dl, .stats dd { margin: 0; }
+  .stats dt { display: inline; }
+  .stats dd { float: right; color: #7fff7f; }
+  .stats div { clear: both; }
+  .wrap { display: grid; grid-template-columns: 1fr 20rem; height: 100vh; height: 100dvh; }
+  @media (max-width: 45em) { .wrap { grid-template-columns: 1fr; grid-template-rows: 50vh auto; height: auto; } }
   .stage { position: relative; background: #000; display: grid; place-items: center; overflow: hidden; }
   .stage video, .stage canvas { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 100%; max-height: 100%; }
   .stage video { visibility: hidden; }
   .side { background: #0f1a0f; border-left: 1px solid #1f3a1f; padding: 16px; overflow: auto; }
-  h1 { font-size: 16px; margin: 0 0 12px; color: #7fff7f; letter-spacing: .5px; }
-  h2 { font-size: 12px; margin: 16px 0 6px; color: #7fff7f; text-transform: uppercase; letter-spacing: 1px; }
-  label { display: block; margin: 6px 0 2px; font-size: 11px; color: #a0d0a0; text-transform: uppercase; letter-spacing: .5px; }
+  h1 { font-size: 1rem; margin: 0 0 12px; color: #7fff7f; letter-spacing: .5px; }
+  h2 { font-size: 0.75rem; margin: 16px 0 6px; color: #7fff7f; text-transform: uppercase; letter-spacing: 1px; }
+  label { display: block; margin: 6px 0 2px; font-size: 0.75rem; color: #a0d0a0; text-transform: uppercase; letter-spacing: .5px; }
   input[type=text], select { width: 100%; box-sizing: border-box; background: #050a05; color: #d6ffd6; border: 1px solid #2a4a2a; padding: 6px 8px; font: inherit; border-radius: 3px; }
   input[type=range] { width: 100%; }
   input[type=file] { font: inherit; color: #a0d0a0; }
   button { background: #1f3a1f; color: #d6ffd6; border: 1px solid #2a4a2a; padding: 6px 10px; font: inherit; cursor: pointer; border-radius: 3px; }
-  button:hover { background: #2a4a2a; }
+  @media (hover: hover) { button:hover { background: #2a4a2a; } }
+  button:active { translate: 0 1px; }
+  :focus-visible { outline: 2px solid #7fff7f; outline-offset: 2px; }
   button.primary { background: #2d5a2d; border-color: #4a7a4a; }
-  button.primary:hover { background: #4a7a4a; }
+  @media (hover: hover) { button.primary:hover { background: #4a7a4a; } }
   .row { display: flex; gap: 6px; margin-top: 6px; }
   .row > * { flex: 1; }
-  .stats { font-size: 12px; color: #a0d0a0; line-height: 1.8; }
-  .stats span { color: #7fff7f; float: right; }
-  .status { font-size: 11px; color: #a0d0a0; margin-top: 8px; min-height: 1.4em; }
+  .stats { font-size: 0.75rem; color: #a0d0a0; line-height: 1.8; }
+  .status { font-size: 0.75rem; color: #a0d0a0; margin-top: 8px; min-height: 1.4em; }
   .status.err { color: #ff6a6a; }
-  .audit-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; margin-top: 8px; max-height: 260px; overflow-y: auto; }
-  .audit-grid .cell { position: relative; cursor: pointer; border: 1px solid #2a4a2a; background: #000; }
-  .audit-grid .cell img { display: block; width: 100%; height: auto; }
-  .audit-grid .cell .lbl { position: absolute; left: 2px; bottom: 2px; font-size: 9px; background: rgba(0,0,0,.7); color: #d6ffd6; padding: 1px 3px; border-radius: 2px; }
-  .audit-grid .cell.hit { border-color: #4a7a4a; }
-  .audit-grid .cell.miss { border-color: #7a4a4a; }
-  .audit-grid .cell.pending { border-color: #7a7a4a; }
-  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none; align-items: center; justify-content: center; z-index: 100; }
-  .modal.show { display: flex; }
-  .modal .card { background: #0f1a0f; border: 1px solid #2a4a2a; padding: 12px; max-width: 90vw; max-height: 90vh; overflow: auto; }
-  .modal canvas { display: block; max-width: 86vw; max-height: 70vh; background: #000; }
-  .modal .meta { font-size: 12px; color: #a0d0a0; margin-top: 8px; }
-  .modal .meta span { color: #7fff7f; }
-  .modal .nav { margin-top: 8px; display: flex; gap: 6px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="stage">
     <video id="video" playsinline muted crossorigin="anonymous"></video>
-    <canvas id="overlay"></canvas>
+    <canvas id="overlay" role="img" aria-label="Video with detections, tracks, kill-zone and aim reticle"></canvas>
   </div>
   <div class="side">
     <h1>Motion Detector · WASM</h1>
 
     <h2>Source</h2>
-    <label>Mode</label>
+    <label for="mode">Mode</label>
     <select id="mode">
       <option value="webcam">Webcam</option>
       <option value="url" selected>URL</option>
       <option value="file">Upload file</option>
     </select>
-    <label>Video URL</label>
+    <label for="url">Video URL</label>
     <input id="url" type="text" placeholder="https://.../video.mp4" value="" />
-    <label>Upload</label>
+    <label for="file">Upload</label>
     <input id="file" type="file" accept="video/*" />
     <div class="row">
-      <button id="start" class="primary">Start</button>
-      <button id="stop">Stop</button>
+      <button type="button" id="start" class="primary">Start</button>
+      <button type="button" id="stop">Stop</button>
     </div>
 
     <h2>Detection</h2>
-    <label>Fixed threshold floor <span id="thrv">10</span></label>
+    <label for="thr">Fixed threshold floor <output id="thrv" for="thr">10</output></label>
     <input id="thr" type="range" min="2" max="80" value="10" />
-    <label>Adaptive k·std <span id="kv">2.0</span></label>
+    <label for="k">Adaptive k·std <output id="kv" for="k">2.0</output></label>
     <input id="k" type="range" min="0" max="500" value="200" />
-    <label>Min area <span id="minv">3</span></label>
+    <label for="min">Min area <output id="minv" for="min">3</output></label>
     <input id="min" type="range" min="1" max="200" value="3" />
-    <label>Max area <span id="maxv">2000</span></label>
+    <label for="max">Max area <output id="maxv" for="max">2000</output></label>
     <input id="max" type="range" min="50" max="20000" value="2000" />
     <label><input id="morph" type="checkbox" checked /> Morphology open (3×3)</label>
-    <label>Camera-motion gate <span id="gatev">0.20</span></label>
+    <label for="gate">Camera-motion gate <output id="gatev" for="gate">0.20</output></label>
     <input id="gate" type="range" min="50" max="500" value="200" />
 
     <h2>Turret (WebSerial)</h2>
     <div class="row">
-      <button id="serConnect">Connect</button>
-      <button id="serDisconnect">Disconnect</button>
+      <button type="button" id="serConnect">Connect</button>
+      <button type="button" id="serDisconnect">Disconnect</button>
     </div>
-    <label>Fire mode</label>
+    <label for="fireMode">Fire mode</label>
     <select id="fireMode">
       <option value="off" selected>Off (aim only, no fire bit)</option>
       <option value="dry">Dry run (log, don't send)</option>
       <option value="live">Live (send fire=1 when inside zone)</option>
     </select>
-    <label>Target pick</label>
+    <label for="targetPick">Target pick</label>
     <select id="targetPick">
       <option value="largest" selected>Largest area</option>
       <option value="center">Closest to center</option>
       <option value="fastest">Fastest moving</option>
     </select>
-    <label>Lead time (ms) <span id="leadv">20</span></label>
+    <label for="lead">Lead time (ms) <output id="leadv" for="lead">20</output></label>
     <input id="lead" type="range" min="0" max="200" value="20" />
-    <label>Kill-zone (fraction of frame) <span id="kzv">0.6</span></label>
+    <label for="kz">Kill-zone (fraction of frame) <output id="kzv" for="kz">0.6</output></label>
     <input id="kz" type="range" min="0" max="100" value="60" />
-    <div id="serStatus" class="status">Not connected.</div>
+    <label><input id="tgtStill" type="checkbox" /> Also target near-stationary tracks (landed/walking)</label>
+    <label for="dwell">Max dwell per shot (ms) <output id="dwellv" for="dwell">400</output></label>
+    <input id="dwell" type="range" min="20" max="1000" value="400" />
+    <div id="serStatus" class="status" role="status">Not connected.</div>
+
+    <h2>Calibration (pixel → galvo)</h2>
+    <label for="calGrid">Grid</label>
+    <select id="calGrid">
+      <option value="3">3×3</option>
+      <option value="4" selected>4×4</option>
+      <option value="5">5×5</option>
+    </select>
+    <label for="calM">DAC margin <output id="calMv" for="calM">500</output></label>
+    <input id="calM" type="range" min="0" max="1500" value="500" />
+    <div class="row">
+      <button type="button" id="calRun">Calibrate (guide laser)</button>
+      <button type="button" id="calClear">Clear</button>
+    </div>
+    <div id="calStatus" class="status" role="status">No calibration.</div>
 
     <h2>Hit audit</h2>
-    <div class="stats">
-      <div>Would-fire events <span id="s_cap">0</span></div>
-      <div>Mean aim error <span id="s_err">—</span></div>
-      <div>Hit rate (&lt;8 px) <span id="s_hits">—</span></div>
-    </div>
-    <div class="row"><button id="auditExport">Export audit JSON</button></div>
+    <dl class="stats">
+      <div><dt>Would-fire events</dt><dd id="s_cap">0</dd></div>
+      <div><dt>Mean aim error</dt><dd id="s_err">—</dd></div>
+      <div><dt>Hit rate (&lt;8 px)</dt><dd id="s_hits">—</dd></div>
+    </dl>
+    <div class="row"><button type="button" id="auditExport">Export audit JSON</button></div>
 
     <h2>Tracking</h2>
-    <label>Persistence (hits of last 5) <span id="persv">2</span></label>
+    <label for="pers">Persistence (hits of last 5) <output id="persv" for="pers">2</output></label>
     <input id="pers" type="range" min="1" max="5" value="2" />
-    <label>Track radius (px) <span id="radv">15</span></label>
+    <label for="rad">Track radius (px) <output id="radv" for="rad">15</output></label>
     <input id="rad" type="range" min="5" max="80" value="15" />
-    <label>Min spread (px, 0=off) <span id="spreadv">6</span></label>
+    <label for="spread">Min spread (px, 0=off) <output id="spreadv" for="spread">6</output></label>
     <input id="spread" type="range" min="0" max="40" value="6" />
-    <label>Spread window (frames) <span id="swinv">8</span></label>
+    <label for="swin">Spread window (frames) <output id="swinv" for="swin">8</output></label>
     <input id="swin" type="range" min="3" max="20" value="8" />
 
     <h2>Stats</h2>
-    <div class="stats">
-      <div>Frame <span id="s_frame">—</span></div>
-      <div>Resolution <span id="s_res">—</span></div>
-      <div>FPS <span id="s_fps">—</span></div>
-      <div>WASM detect <span id="s_wtime">—</span></div>
-      <div>Raw blobs <span id="s_raw">—</span></div>
-      <div>Stationary <span id="s_stat">—</span></div>
-      <div>Confirmed tracks <span id="s_dets">—</span></div>
-    </div>
+    <dl class="stats">
+      <div><dt>Frame</dt><dd id="s_frame">—</dd></div>
+      <div><dt>Resolution</dt><dd id="s_res">—</dd></div>
+      <div><dt>FPS</dt><dd id="s_fps">—</dd></div>
+      <div><dt>WASM detect</dt><dd id="s_wtime">—</dd></div>
+      <div><dt>Raw blobs</dt><dd id="s_raw">—</dd></div>
+      <div><dt>Stationary</dt><dd id="s_stat">—</dd></div>
+      <div><dt>Confirmed tracks</dt><dd id="s_dets">—</dd></div>
+    </dl>
 
-    <div id="status" class="status"></div>
+    <div id="status" class="status" role="status"></div>
   </div>
 </div>
 
@@ -156,6 +174,13 @@ const overlay = document.getElementById('overlay');
 const octx = overlay.getContext('2d');
 const workCanvas = document.createElement('canvas');
 const wctx = workCanvas.getContext('2d', { willReadFrequently: true });
+// Turret protocol coordinates are SOURCE VIDEO pixels, so the homography
+// survives changes to the processing scale.
+let srcW = 0, srcH = 0, workW = 0, workH = 0;
+let calibrating = false;
+const CAL_KEY = 'p2v.turret.cal.v1';
+let cal = null; // { H:[9], srcW, srcH, rmsDac, n }
+try { cal = JSON.parse(localStorage.getItem(CAL_KEY) || 'null'); } catch (e) { cal = null; }
 
 const el = (id) => document.getElementById(id);
 const status = el('status');
@@ -262,6 +287,11 @@ function step() {
       overlay.width = w; overlay.height = h;
       wasm.reset();
     }
+    if (srcW !== vw || srcH !== vh || workW !== w || workH !== h) {
+      srcW = vw; srcH = vh; workW = w; workH = h;
+      if (typeof turretSync === 'function') turretSync();
+    }
+    if (calibrating) { octx.drawImage(video, 0, 0, w, h); requestAnimationFrame(step); return; }
     wctx.drawImage(video, 0, 0, w, h);
     let img;
     try { img = wctx.getImageData(0, 0, w, h); }
@@ -389,12 +419,17 @@ function step() {
     const fireable = confirmed.filter(t =>
       t.age >= 3 && (t.cooldown || 0) === 0 && t.history.length >= 3 && diamOf(t.history, 6) >= 4
     );
+    if (el('tgtStill').checked) {
+      for (const t of stationary) {
+        if (t.age >= 5 && (t.cooldown || 0) === 0) fireable.push(t);
+      }
+    }
     const target = pickTarget(fireable, w, h);
     if (target) {
       const fpsNow = +el('s_fps').textContent || 30;
       const aim = predictAim(target, +el('lead').value, fpsNow);
       const inside = aim.x >= kz.x0 && aim.x <= kz.x1 && aim.y >= kz.y0 && aim.y <= kz.y1;
-      const fireBit = (fireMode === 'live' && inside) ? 1 : 0;
+      const fireBit = (fireMode === 'live' && inside && cal) ? 1 : 0;
       // Record every would-fire moment regardless of fire mode (inside kill-zone).
       if (inside) {
         audit.record(frameN, target.id, aim);
@@ -410,7 +445,8 @@ function step() {
       octx.moveTo(aim.x, aim.y - 14); octx.lineTo(aim.x, aim.y + 14);
       octx.stroke();
 
-      const line = 'A ' + aim.x.toFixed(1) + ' ' + aim.y.toFixed(1) + ' ' + fireBit;
+      const sx = aim.x * srcW / w, sy = aim.y * srcH / h;
+      const line = 'A ' + sx.toFixed(1) + ' ' + sy.toFixed(1) + ' ' + fireBit;
       if (fireMode === 'dry') {
         // log every ~10th frame to avoid flooding
         if (frameN % 10 === 0) say('[dry] ' + line);
@@ -575,6 +611,7 @@ const turret = (() => {
       reader = td.readable.getReader();
       readLoopP = readLoop();
       status('Connected. Flip arming switch to enable.');
+      setTimeout(turretSync, 300);
     } catch (e) { status('Connect failed: ' + e.message, true); }
   }
 
@@ -671,6 +708,150 @@ function predictAim(t, leadMs, fps, nSteps = 4) {
   const last = h[h.length - 1];
   return { x: last.cx + vx * dt, y: last.cy + vy * dt };
 }
+
+// ---- Turret config sync: kill-zone, dwell, homography ----
+function turretSync() {
+  if (!turret.connected() || !workW) return;
+  const kz = killZone(workW, workH);
+  const fx = srcW / workW, fy = srcH / workH;
+  turret.sendLine('K ' + (kz.x0 * fx).toFixed(1) + ' ' + (kz.y0 * fy).toFixed(1) + ' ' +
+                  (kz.x1 * fx).toFixed(1) + ' ' + (kz.y1 * fy).toFixed(1));
+  turret.sendLine('D ' + (+el('dwell').value));
+  if (cal && cal.srcW === srcW && cal.srcH === srcH) {
+    turret.sendLine('H ' + cal.H.map(v => v.toPrecision(9)).join(' '));
+  } else if (cal) {
+    calStatus('Calibration was made at ' + cal.srcW + '×' + cal.srcH + ', source is now ' + srcW + '×' + srcH + '. Recalibrate.', true);
+  }
+}
+el('kz').addEventListener('change', turretSync);
+el('dwell').addEventListener('input', () => { el('dwellv').textContent = el('dwell').value; });
+el('dwell').addEventListener('change', turretSync);
+el('calM').addEventListener('input', () => { el('calMv').textContent = el('calM').value; });
+
+function calStatus(msg, err = false) {
+  const n = el('calStatus'); n.textContent = msg; n.className = 'status' + (err ? ' err' : '');
+}
+if (cal) calStatus('Loaded: ' + cal.n + ' pts, RMS ' + cal.rmsDac.toFixed(1) + ' DAC @ ' + cal.srcW + '×' + cal.srcH);
+
+// Solve A x = b (n×n) by Gaussian elimination with partial pivoting.
+function solve(A, b) {
+  const n = b.length;
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (Math.abs(A[p][c]) < 1e-12) return null;
+    [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+    for (let r = c + 1; r < n; r++) {
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  const x = new Array(n);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = b[r];
+    for (let k = r + 1; k < n; k++) s -= A[r][k] * x[k];
+    x[r] = s / A[r][r];
+  }
+  return x;
+}
+const mat3mul = (A, B) => { const C = new Array(9).fill(0);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) C[i*3+j] += A[i*3+k] * B[k*3+j];
+  return C; };
+function normT(pts) { // Hartley normalisation
+  const n = pts.length; let mx = 0, my = 0;
+  for (const p of pts) { mx += p[0]; my += p[1]; } mx /= n; my /= n;
+  let d = 0; for (const p of pts) d += Math.hypot(p[0] - mx, p[1] - my); d /= n;
+  const s = d > 0 ? Math.SQRT2 / d : 1;
+  return { T: [s, 0, -s * mx, 0, s, -s * my, 0, 0, 1], Ti: [1 / s, 0, mx, 0, 1 / s, my, 0, 0, 1] };
+}
+function applyH(H, x, y) {
+  const w = H[6] * x + H[7] * y + H[8];
+  return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w];
+}
+// Least-squares homography src(pixel) -> dst(DAC), >= 4 points.
+function fitHomography(src, dst) {
+  const a = normT(src), b = normT(dst);
+  const ps = src.map(p => applyH(a.T, p[0], p[1])), pd = dst.map(p => applyH(b.T, p[0], p[1]));
+  const AtA = Array.from({ length: 8 }, () => new Array(8).fill(0)), Atb = new Array(8).fill(0);
+  const add = (row, rhs) => { for (let i = 0; i < 8; i++) { Atb[i] += row[i] * rhs; for (let j = 0; j < 8; j++) AtA[i][j] += row[i] * row[j]; } };
+  for (let i = 0; i < ps.length; i++) {
+    const [x, y] = ps[i], [u, v] = pd[i];
+    add([x, y, 1, 0, 0, 0, -u * x, -u * y], u);
+    add([0, 0, 0, x, y, 1, -v * x, -v * y], v);
+  }
+  const h = solve(AtA, Atb); if (!h) return null;
+  let H = mat3mul(b.Ti, mat3mul([...h, 1], a.T));
+  return H.map(v => v / H[8]);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const calCanvas = document.createElement('canvas');
+const cctx = calCanvas.getContext('2d', { willReadFrequently: true });
+function grab() {
+  calCanvas.width = workW; calCanvas.height = workH;
+  cctx.drawImage(video, 0, 0, workW, workH);
+  return cctx.getImageData(0, 0, workW, workH).data;
+}
+// Find the guide-laser dot: biggest brightness increase (on vs off frame),
+// sub-pixel centroid within an 11 px window. Returns null if too weak.
+function findDot(off, on) {
+  const n = workW * workH, diff = new Float32Array(n);
+  let best = 0, bi = -1;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const d = Math.max(0, on[j] - off[j]) + Math.max(0, on[j+1] - off[j+1]) + Math.max(0, on[j+2] - off[j+2]);
+    diff[i] = d; if (d > best) { best = d; bi = i; }
+  }
+  if (best < 60) return null;
+  const bx = bi % workW, by = (bi / workW) | 0, R = 5, thr = best * 0.5;
+  let sw = 0, sx = 0, sy = 0;
+  for (let y = Math.max(0, by - R); y <= Math.min(workH - 1, by + R); y++)
+    for (let x = Math.max(0, bx - R); x <= Math.min(workW - 1, bx + R); x++) {
+      const d = diff[y * workW + x]; if (d < thr) continue;
+      sw += d; sx += d * x; sy += d * y;
+    }
+  return [sx / sw, sy / sw, best];
+}
+
+async function calibrate() {
+  if (!turret.connected()) { calStatus('Connect the turret first.', true); return; }
+  if (!workW || video.paused) { calStatus('Start the camera first.', true); return; }
+  if (el('fireMode').value === 'live') el('fireMode').value = 'off';
+  calibrating = true;
+  const N = +el('calGrid').value, M = +el('calM').value;
+  const src = [], dst = [];
+  try {
+    for (let gy = 0; gy < N; gy++) for (let gx = 0; gx < N; gx++) {
+      const dx = Math.round(M + (4095 - 2 * M) * gx / (N - 1));
+      const dy = Math.round(M + (4095 - 2 * M) * gy / (N - 1));
+      calStatus('Point ' + (gy * N + gx + 1) + '/' + N * N + ' → DAC ' + dx + ',' + dy);
+      turret.sendLine('C ' + dx + ' ' + dy + ' 0'); await sleep(250);
+      const off = grab();
+      turret.sendLine('C ' + dx + ' ' + dy + ' 1'); await sleep(250);
+      const on = grab();
+      turret.sendLine('C ' + dx + ' ' + dy + ' 0');
+      const dot = findDot(off, on);
+      if (!dot) continue;
+      src.push([dot[0] * srcW / workW, dot[1] * srcH / workH]); dst.push([dx, dy]);
+      octx.strokeStyle = '#40ff80'; octx.beginPath(); octx.arc(dot[0], dot[1], 6, 0, 7); octx.stroke();
+    }
+  } finally {
+    turret.sendLine('C 2048 2048 0');
+    calibrating = false;
+  }
+  if (src.length < 4) { calStatus('Only ' + src.length + ' dots seen (need ≥4). Darken room / check guide laser.', true); return; }
+  const H = fitHomography(src, dst);
+  if (!H) { calStatus('Degenerate point set — recalibrate.', true); return; }
+  let se = 0;
+  for (let i = 0; i < src.length; i++) { const [u, v] = applyH(H, src[i][0], src[i][1]); se += (u - dst[i][0]) ** 2 + (v - dst[i][1]) ** 2; }
+  const rms = Math.sqrt(se / src.length);
+  cal = { H, srcW, srcH, rmsDac: rms, n: src.length };
+  try { localStorage.setItem(CAL_KEY, JSON.stringify(cal)); } catch (e) {}
+  calStatus('OK: ' + src.length + '/' + N * N + ' pts, RMS ' + rms.toFixed(1) + ' DAC' + (rms > 40 ? ' (high — check lens distortion / dot detection)' : ''), rms > 40);
+  turretSync();
+}
+el('calRun').addEventListener('click', () => { calibrate().catch(e => { calibrating = false; calStatus('Calibration error: ' + e.message, true); }); });
+el('calClear').addEventListener('click', () => { cal = null; try { localStorage.removeItem(CAL_KEY); } catch (e) {} calStatus('No calibration. Live fire disabled.'); });
 
 // ---- Audit: measure aim quality live ----
 // For every would-fire moment, record predicted aim + trackId. On the

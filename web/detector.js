@@ -36,7 +36,7 @@ export function iou(a, b) {
  * @returns kept candidates, highest score first
  */
 export function nms(candidates, iouThreshold) {
-  const sorted = [...candidates].sort((a, b) => b.score - a.score);
+  const sorted = candidates.toSorted((a, b) => b.score - a.score);
   const kept = [];
   for (const c of sorted) {
     if (!kept.some(k => k.group === c.group && iou(k.box, c.box) > iouThreshold)) kept.push(c);
@@ -65,6 +65,22 @@ async function fetchBytes(url, onProgress) {
   let offset = 0;
   for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
   return bytes;
+}
+
+/**
+ * ONNX Runtime is loaded with `async fetchpriority="low"` so it never delays
+ * the first video frame or the motion loop; wait for it here instead.
+ */
+function ortLoaded() {
+  if (typeof ort !== 'undefined') return Promise.resolve();
+  const script = document.getElementById('ortScript');
+  if (!script) return Promise.reject(new Error('ONNX Runtime script tag missing'));
+  const { promise, resolve, reject } = Promise.withResolvers();
+  script.addEventListener('load', () => typeof ort !== 'undefined' ? resolve() : reject(new Error('ONNX Runtime failed to load')), { once: true });
+  script.addEventListener('error', (e) => reject(new Error('ONNX Runtime failed to load', { cause: e })), { once: true });
+  // Already finished (with an error) before we started listening.
+  if (script.dataset.state === 'error') reject(new Error('ONNX Runtime failed to load'));
+  return promise;
 }
 
 export class Detector {
@@ -96,7 +112,7 @@ export class Detector {
   getBackend() { return this.backend; }
 
   async init(modelPath = 'models/yolov11n.onnx', { onProgress } = {}) {
-    if (typeof ort === 'undefined') throw new Error('ONNX Runtime failed to load');
+    await ortLoaded();
 
     // Pick the backend up front. With WebGPU the heavy work happens on the GPU;
     // with WASM, run inference in ORT's proxy worker so a slow model cannot

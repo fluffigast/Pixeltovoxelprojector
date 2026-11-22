@@ -2,7 +2,7 @@
 // detector over USB-serial (WebSerial).
 //
 // Hardware assumed:
-//   - Teensy 4.x / Arduino Uno-class MCU
+//   - Raspberry Pi Pico 2 (arduino-pico core) / Teensy 4.x / Uno-class MCU
 //   - MCP4822 dual 12-bit DAC on SPI (CS pin below)
 //     -> DAC_A -> galvo X-axis driver input
 //     -> DAC_B -> galvo Y-axis driver input
@@ -13,7 +13,10 @@
 //   - Laser TTL enable (active-HIGH) wired to LASER_TTL_PIN.
 //     ALSO wire the laser driver's enable through the physical arming
 //     switch in series — software must not be the only interlock.
-//   - Physical arming switch -> ARM_PIN (HIGH = armed).
+//   - Physical arming key switch -> ARM_PIN, closes to GND = ARMED.
+//     (Fail-safe: a broken wire reads HIGH via pull-up = disarmed.)
+//   - Low-power guide laser (class 2, <1 mW, coaxial with the main beam
+//     via a beam combiner) on AIM_PIN, used only for calibration.
 //   - Enclosure lid microswitch -> LID_PIN (LOW = lid closed).
 //   - Status LED on LED_PIN (optional).
 //
@@ -22,12 +25,14 @@
 //   H <h00..h22>\n      set 3x3 homography (9 floats, row-major)
 //   K <x0> <y0> <x1> <y1>\n  set kill-zone rectangle in pixel coords
 //   D <ms>\n            set max continuous dwell in ms
+//   C <dx> <dy> <g>\n   calibration: raw DAC aim, guide laser g=0/1,
+//                       main laser forced OFF (guide auto-off after 1 s)
 //   V\n                 version/status request
 // MCU responses:
 //   OK\n, ERR <msg>\n, ST armed=<0|1> lid=<0|1> fire=<0|1>\n
 //
 // Safety model (do not weaken):
-//   1. ARM_PIN must read HIGH (hardware switch).
+//   1. ARM_PIN must read LOW (hardware key switch closed to GND).
 //   2. LID_PIN must read LOW (enclosure closed).
 //   3. Target pixel must be inside the configured kill-zone rectangle.
 //   4. Watchdog: no fresh A command in WATCHDOG_MS -> fire off.
@@ -37,16 +42,27 @@
 #include <SPI.h>
 
 // ---- Pins ----
+#if defined(ARDUINO_ARCH_RP2040)
+// Pico / Pico 2: SPI0 default SCK=GP18, MOSI=GP19 (MISO GP16 unused)
+static constexpr int DAC_CS_PIN     = 17;
+static constexpr int LASER_TTL_PIN  = 15;
+static constexpr int AIM_PIN        = 14;  // guide laser enable (active HIGH)
+static constexpr int ARM_PIN        = 13;  // INPUT_PULLUP; key switch to GND = ARMED
+static constexpr int LID_PIN        = 12;  // INPUT_PULLUP; switch closes to GND when lid is shut
+#else
 static constexpr int DAC_CS_PIN     = 10;
 static constexpr int LASER_TTL_PIN  = 6;
-static constexpr int ARM_PIN        = 2;   // use INPUT_PULLUP; switch to GND to disarm
+static constexpr int AIM_PIN        = 7;   // guide laser enable (active HIGH)
+static constexpr int ARM_PIN        = 2;   // INPUT_PULLUP; key switch to GND = ARMED
 static constexpr int LID_PIN        = 3;   // INPUT_PULLUP; switch closes to GND when lid is shut
+#endif
 static constexpr int LED_PIN        = LED_BUILTIN;
 
 // ---- Timing (ms) ----
 static constexpr uint32_t WATCHDOG_MS       = 150;
 static constexpr uint32_t DEFAULT_DWELL_MS  = 400;
 static constexpr uint32_t STATUS_PERIOD_MS  = 250;
+static constexpr uint32_t GUIDE_TIMEOUT_MS  = 1000;
 
 // ---- DAC ----
 static constexpr uint16_t DAC_MIN = 0;
@@ -78,6 +94,8 @@ bool     dwellLatched   = false; // dwell cutoff until next '0' message
 uint16_t curDacX        = DAC_MID;
 uint16_t curDacY        = DAC_MID;
 uint32_t lastStatusMs   = 0;
+uint32_t lastGuideMs    = 0;
+bool     guideOn        = false;
 
 char lineBuf[192];
 uint8_t lineLen = 0;
@@ -119,7 +137,7 @@ bool insideKillZone(float px, float py) {
   return px >= kzX0 && px <= kzX1 && py >= kzY0 && py <= kzY1;
 }
 
-bool armed()    { return digitalRead(ARM_PIN) == HIGH; }
+bool armed()    { return digitalRead(ARM_PIN) == LOW;  } // fail-safe: open wire = disarmed
 bool lidClosed(){ return digitalRead(LID_PIN) == LOW;  }
 
 void setFire(bool on) {
@@ -129,8 +147,15 @@ void setFire(bool on) {
   if (on) fireStartMs = millis();
 }
 
+void setGuide(bool on) {
+  guideOn = on;
+  digitalWrite(AIM_PIN, on ? HIGH : LOW);
+  if (on) lastGuideMs = millis();
+}
+
 void disableAll() {
   setFire(false);
+  setGuide(false);
   dwellLatched = false;
 }
 
@@ -148,6 +173,7 @@ void handleA(char* args) {
   uint16_t dx, dy;
   if (!pixelToDac(px, py, dx, dy)) { Serial.println("ERR homog"); return; }
   dacWrite(dx, dy);
+  if (guideOn) setGuide(false);
   lastAimMs = millis();
 
   bool allowFire = (f != 0) && armed() && lidClosed() && insideKillZone(px, py) && !dwellLatched;
@@ -182,6 +208,17 @@ void handleD(char* args) {
   Serial.println("OK");
 }
 
+void handleC(char* args) {
+  // "C <dacx> <dacy> <guide>" — calibration only, never fires the main laser.
+  char* a = strtok(args, " \t"); char* b = strtok(NULL, " \t"); char* c = strtok(NULL, " \t");
+  if (!a || !b || !c) { Serial.println("ERR fmt"); return; }
+  setFire(false);
+  dwellLatched = false;
+  dacWrite(clampDac(atof(a)), clampDac(atof(b)));
+  setGuide(atoi(c) != 0);
+  Serial.println("OK");
+}
+
 void handleV() {
   Serial.print("ST armed="); Serial.print(armed() ? 1 : 0);
   Serial.print(" lid=");     Serial.print(lidClosed() ? 1 : 0);
@@ -200,6 +237,7 @@ void dispatch(char* line) {
     case 'H': handleH(args); break;
     case 'K': handleK(args); break;
     case 'D': handleD(args); break;
+    case 'C': handleC(args); break;
     case 'V': handleV();     break;
     default:  Serial.println("ERR op");
   }
@@ -225,6 +263,7 @@ void readSerial() {
 void setup() {
   pinMode(DAC_CS_PIN,    OUTPUT); digitalWrite(DAC_CS_PIN, HIGH);
   pinMode(LASER_TTL_PIN, OUTPUT); digitalWrite(LASER_TTL_PIN, LOW);
+  pinMode(AIM_PIN,       OUTPUT); digitalWrite(AIM_PIN, LOW);
   pinMode(ARM_PIN,       INPUT_PULLUP);
   pinMode(LID_PIN,       INPUT_PULLUP);
   pinMode(LED_PIN,       OUTPUT);
@@ -252,6 +291,8 @@ void loop() {
     setFire(false);
     dwellLatched = true;
   }
+  // Guide laser auto-off if the host stops refreshing C commands.
+  if (guideOn && (now - lastGuideMs) > GUIDE_TIMEOUT_MS) setGuide(false);
   // Interlock re-check every loop; if ARM/LID changes, drop fire immediately.
   if (fireActive && (!armed() || !lidClosed())) {
     setFire(false);

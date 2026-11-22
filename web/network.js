@@ -27,7 +27,7 @@ export class Network {
   /** @throws {Error} if the URL is not a valid ws:// or wss:// address */
   connect(url, role, deviceName) {
     let parsed;
-    try { parsed = new URL(url); } catch { throw new Error('Not a valid URL: ' + url); }
+    try { parsed = new URL(url); } catch (err) { throw new Error('Not a valid URL: ' + url, { cause: err }); }
     if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
       throw new Error('Server URL must start with ws:// or wss://');
     }

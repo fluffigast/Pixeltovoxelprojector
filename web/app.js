@@ -33,7 +33,7 @@ for (const name of ['person', 'bicycle', 'car', 'motorcycle', 'bus', 'train', 't
   'cat', 'dog', 'horse', 'sheep', 'cow']) YOLO_CLASS_MAP[name] = MASK;
 const MASK_MARGIN = 0.08;        // masks are grown by this fraction on every side
 
-const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+const IS_MOBILE = deviceKind() === 'Phone';   // UA Client Hints / pointer type, see deviceKind()
 // Frames larger than this are downscaled before analysis. Phones get a smaller
 // budget: the per-pixel work is what limits their frame rate.
 const MAX_PROCESS_SIDE = IS_MOBILE ? 960 : 1280;
@@ -54,7 +54,9 @@ const view = $('view');
 const overlay = $('overlayCanvas');
 const statusEl = $('status');
 const statusText = $('statusText');
-const statusSpinner = statusEl.querySelector('.spinner');
+const statusSpinner = statusEl.querySelector('.loading-spinner');
+const playBtn = $('playBtn');
+const lnaHelp = $('lnaHelp');
 const retryBtn = $('retryBtn');
 const sourceSelect = $('sourceSelect');
 const fileInput = $('fileInput');
@@ -94,9 +96,10 @@ let link = null;             // whichever of the two is in use
 let dashboardMode = false;   // this device is showing other devices' feeds
 
 // --- Status display ---
-function showStatus(msg, { spinner = false } = {}) {
+function showStatus(msg, { spinner = false, play = false } = {}) {
   statusText.textContent = msg;
   statusSpinner.hidden = !spinner;
+  playBtn.hidden = !play;
   statusEl.hidden = false;
 }
 function hideStatus() {
@@ -205,7 +208,7 @@ async function setSource(source, file) {
       showStatus(cameraErrorMessage(e) + ' Use a sample video or upload a file.');
       log('Camera unavailable: ' + (e?.message || e));
     } else if (e?.name === 'NotAllowedError') {
-      showStatus('Tap the video to start playback.');
+      showStatus('Playback needs a tap or key press.', { play: true });
     } else {
       showStatus('Could not load video. Try a different file.');
       log('Video failed to load: ' + (e?.message || e));
@@ -453,7 +456,7 @@ const remoteSources = new Map();   // sourceId -> name
 
 /** "Phone K7": a short tag keeps two phones apart on the dashboard. */
 function getDeviceName() {
-  const kind = IS_MOBILE ? 'Phone' : 'Computer';
+  const kind = deviceKind();
   let tag = '';
   try { tag = localStorage.getItem('bugspotter-device-tag') || ''; } catch { /* storage unavailable */ }
   if (!/^[A-Z0-9]{2}$/.test(tag)) {
@@ -467,7 +470,7 @@ const deviceName = getDeviceName();
 function renderDeviceList() {
   deviceList.textContent = '';
   for (const name of remoteSources.values()) {
-    const item = document.createElement('div');
+    const item = document.createElement('li');
     item.className = 'device-item';
     const dot = document.createElement('span');
     dot.className = 'device-dot connected';
@@ -490,6 +493,44 @@ function setDashboardMode(on) {
     dashboard.clear();
     if (video.currentSrc || video.srcObject) video.play().catch(() => {});
   }
+}
+
+// --- Local Network Access (Chrome): ws:// to localhost / LAN from an https page ---
+const PRIVATE_V4 = [/^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./];
+/** 'loopback-network' | 'local-network' | null (public host) for a ws(s):// URL. */
+function addressSpaceFor(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
+  host = host.replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '::1') return 'loopback-network';
+  if (host.endsWith('.local') || PRIVATE_V4.some(r => r.test(host)) || /^(fc|fd|fe80)/.test(host)) return 'local-network';
+  return null;
+}
+
+/** Permission state for the address space, or 'unsupported'. Never queries the legacy combined name. */
+async function lnaPermission(space) {
+  if (!space || !navigator.permissions?.query) return 'unsupported';
+  try {
+    const status = await navigator.permissions.query({ name: space });
+    status.onchange = () => showLnaHelp(space, status.state);
+    return status.state;
+  } catch {
+    return 'unsupported';   // browser without Local Network Access permissions
+  }
+}
+
+function showLnaHelp(space, state) {
+  lnaHelp.hidden = state !== 'denied';
+  if (state === 'denied') {
+    lnaHelp.textContent = 'This site is blocked from ' + (space === 'loopback-network' ? 'apps on this device' : 'devices on your local network') +
+      '. Allow "Local network access" for this site in the browser\'s site settings, then press Connect again.';
+  }
+}
+
+/** Coarse form factor via UA Client Hints or feature detection, not UA-string sniffing. */
+function deviceKind() {
+  const mobile = navigator.userAgentData?.mobile ?? matchMedia('(pointer: coarse)').matches;
+  return mobile ? 'Phone' : 'Desktop';
 }
 
 function joinLink() {
@@ -561,7 +602,7 @@ function startLink(which, target, role) {
     which.connect(target, role, deviceName);
   } catch (e) {
     link = null;
-    log(e.message);
+    log(e.message + (e.cause ? ' (' + e.cause.message + ')' : ''));
     updateLinkUi();
     return false;
   }
@@ -623,12 +664,19 @@ function setupLinks() {
   // Relay server (server.js). When the page is served by it, it is on the same host.
   if (location.protocol === 'http:' && location.port) serverUrl.value = 'ws://' + location.host;
   const relayRole = params.get('role') === 'viewer' ? 'viewer' : 'source';
-  connectBtn.addEventListener('click', () => {
+  // Connecting only ever starts from this click, so a Local Network Access
+  // prompt is tied to a user gesture and never fires on page load.
+  connectBtn.addEventListener('click', async () => {
     if (linkActive()) { stopLink(); return; }
     const url = serverUrl.value.trim() || 'ws://localhost:8080';
+    const space = addressSpaceFor(url);
+    const state = await lnaPermission(space);
+    showLnaHelp(space, state);
+    if (state === 'denied') { log('Local network access denied for ' + url); return; }
+    if (linkActive()) return;   // something else connected while the permission was checked
     if (!startLink(relayLink, url, relayRole)) return;
-    if (location.protocol === 'https:' && url.startsWith('ws://') && !/^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(url)) {
-      log('Browsers block ws:// from an https:// page — use wss://, or use a room code instead.');
+    if (location.protocol === 'https:' && url.startsWith('ws://') && !space) {
+      log('Browsers block ws:// to a public host from an https:// page — use wss://, or use a room code instead.');
     }
   });
 
@@ -673,6 +721,7 @@ for (const target of [uploadArea, view]) {
 function applyConfidence() {
   const v = Number(confSlider.value) / 100;
   confValue.textContent = v.toFixed(2);
+  confSlider.setAttribute('aria-valuetext', v.toFixed(2));
   detector.setConfidenceThreshold(v);
 }
 confSlider.addEventListener('input', applyConfidence);
@@ -695,12 +744,15 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'KeyC' && !dashboardMode) captureFrame();
 });
 
-// Browsers that refuse autoplay need a gesture; any tap on the video will do.
-view.addEventListener('click', () => {
+// Browsers that refuse autoplay need a gesture: a tap on the video, or the
+// Play button for keyboard and switch users.
+function resumePlayback() {
   if (video.paused && (video.currentSrc || video.srcObject)) {
     video.play().then(hideStatus).catch(() => {});
   }
-});
+}
+view.addEventListener('click', resumePlayback);
+playBtn.addEventListener('click', (e) => { e.stopPropagation(); resumePlayback(); });
 
 retryBtn.addEventListener('click', loadModel);
 

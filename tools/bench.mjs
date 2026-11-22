@@ -21,6 +21,7 @@
 //
 // Frames are decoded once with ffmpeg into BENCH_CACHE (default: the system
 // temp dir) as raw RGBA; frame index = decode order, as in the GT files.
+// BENCH_GT overrides the ground-truth directory (same as --gt).
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -47,7 +48,7 @@ const motionOptions = JSON.parse(opt('mopt', '{}'));
 const trackerOptions = JSON.parse(opt('topt', '{}'));
 const SKIP = Number(opt('skip', 1));
 const MAXSIDE = Number(opt('maxside', 0));
-const gtDir = path.resolve(opt('gt', path.join(ROOT, 'tools', 'gt')));
+const gtDir = path.resolve(opt('gt', process.env.BENCH_GT || path.join(ROOT, 'tools', 'gt')));
 const dumpDir = opt('dump', null);
 
 const { MotionDetector } = await import(pathToFileURL(motionPath));

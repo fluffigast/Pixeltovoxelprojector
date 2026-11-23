@@ -10,29 +10,35 @@ const CLASS_COLORS = {
 // CSS px. Smallest ring drawn around a detection: about a fingertip on a phone.
 const MIN_RING_RADIUS = 12;
 
-// Lock-on animation for the ring. For each target it repeats:
-//   the ring starts wide and closes in on the target (LOCK_MS), then a short
-//   flash marks a shot (SHOT_MS). Every shot counts as one hit.
-// A label shows hits / hits needed as a percentage. At 100% the cycle stops and
-// the normal steady ring stays on the target for as long as it is tracked.
+// Aim ring for insects. The ring shows how well the aim is on the target, frame
+// by frame, and adds up the time it was on:
+//   ON   aim point inside the target's box: tight, solid, bright ring.
+//        Only this time counts.
+//   OFF  aim beside the target, or the target was not found this frame: the
+//        ring is dashed and grows with the size of the miss. Nothing counts.
+// "Aim point" is where the tracker predicted the target to be for this frame;
+// the miss is its distance from where the target was actually found (see
+// tracker.js). The label shows time on target / time needed. At 100% a flash
+// marks it and the ring stays solid.
 // The tracker often loses a target for a moment and finds it again under a new
 // id (crawling insects, crowds). A new id that shows up where a target has just
-// vanished takes over that target's progress, so its hits are not lost.
-// This is drawing only: nothing here knows whether a real shot was fired or landed.
-const LOCK_MS = 800;             // time the ring takes to close in
-const LOCK_START_RADIUS = 44;    // CSS px, ring size at the start of each cycle
-const LOCK_END_RADIUS = 3;       // CSS px, ring size at the moment of the shot
-const SHOT_MS = 220;             // length of the flash
-const CYCLE_MS = LOCK_MS + SHOT_MS;
+// vanished takes over that target's time, so it is not lost.
+// This is measurement and drawing only: nothing here switches a laser, and it
+// cannot tell whether a real shot landed.
+const AIM_OFF_MIN = 6;           // CSS px the ring is wider than ON as soon as the aim is off
+const AIM_GAIN = 2;              // extra CSS px of radius per px of miss
+const AIM_OFF_MAX = 32;          // most the ring grows; also used when the miss is unknown
+const RING_EASE_MS = 40;         // how quickly the ring size follows a change in aim
+const FLASH_MS = 220;            // length of the flash at 100%
 const LOCK_FORGET_MS = 500;      // a target gone for longer than this starts over at 0%
 const HANDOVER_RADIUS = 30;      // CSS px within which a new id continues a vanished target
 const MAX_STEP_MS = 250;         // most time credited between two draws
 
-let hitsNeeded = 3;
+let dwellNeeded = 500;
 
-/** How many hits on one target count as 100% (1–50). Applies to every overlay. */
-export function setHitsNeeded(n) {
-  hitsNeeded = Math.min(50, Math.max(1, Math.round(Number(n)) || 1));
+/** Time on target (ms, 50–60000) that counts as 100%. Applies to every overlay. */
+export function setDwellNeeded(ms) {
+  dwellNeeded = Math.min(60000, Math.max(50, Math.round(Number(ms)) || 500));
 }
 
 const STAT_IDS = [
@@ -48,15 +54,17 @@ export class Renderer {
     this.height = 0;
     this._statEls = null;   // looked up on first use; overlay-only renderers never need them
     this._statText = {};
-    this._locks = new Map();   // detection id -> { active, seen (ms), x, y }, drives the lock-on animation
+    this._locks = new Map();   // detection id -> aim state, see _aim()
   }
 
   /**
-   * Milliseconds this detection has been on screen so far (Infinity if it has no id).
-   * @param {Set} present ids drawn in this call; their progress is not up for takeover
+   * Aim state of a detection: { onMs, r, doneAt } carried from draw to draw
+   * (null if it has no id). Adds the time since the last draw to `onMs` when
+   * the aim is on the target.
+   * @param {Set} present ids drawn in this call; their state is not up for takeover
    */
-  _lockAge(det, cx, cy, now, present) {
-    if (det.id === undefined || det.id === null) return Infinity;   // no identity: steady ring
+  _aim(det, cx, cy, now, present) {
+    if (det.id === undefined || det.id === null) return null;
     let lock = this._locks.get(det.id);
     if (lock && now - lock.seen > LOCK_FORGET_MS) lock = null;       // back after being gone: start over
     if (!lock) {
@@ -72,15 +80,20 @@ export class Renderer {
         lock = this._locks.get(from);
         this._locks.delete(from);
       } else {
-        lock = { active: 0, seen: now, x: cx, y: cy };
+        lock = { onMs: 0, seen: now, x: cx, y: cy, r: null, doneAt: null };
       }
       this._locks.set(det.id, lock);
     }
-    lock.active += Math.min(now - lock.seen, MAX_STEP_MS);
+    const dt = Math.min(now - lock.seen, MAX_STEP_MS);
+    lock.dt = dt;
+    if (det.onTarget && !det.missed && lock.doneAt === null) {
+      lock.onMs += dt;
+      if (lock.onMs >= dwellNeeded) lock.doneAt = now;
+    }
     lock.seen = now;
     lock.x = cx;
     lock.y = cy;
-    return lock.active;
+    return lock;
   }
 
   /** Size the overlay in CSS pixels; the backing store follows devicePixelRatio. */
@@ -99,8 +112,9 @@ export class Renderer {
   }
 
   /**
-   * @param detections boxes in overlay CSS pixels; an `id` that stays the same
-   *   from call to call lets the ring animate and count hits (see LOCK_MS)
+   * @param detections boxes in overlay CSS pixels. For insects, an `id` that stays
+   *   the same from call to call plus `onTarget` and `aimError` (CSS px) drive the
+   *   aim ring and its time-on-target count
    * @param {number} [now] timestamp in ms, same clock on every call
    */
   draw(detections, now = performance.now()) {
@@ -140,42 +154,40 @@ export class Renderer {
       // on dark foliage.
       if (area < 1600) {
         const steady = Math.max(MIN_RING_RADIUS, Math.max(w, h) / 2 + 5);
-        const age = this._lockAge(det, cx, cy, now, present);
-        const tracked = age !== Infinity;
+        // Only insects are aimed at; other small marks keep a plain ring.
+        const aim = det.label === 'insect' ? this._aim(det, cx, cy, now, present) : null;
+        const done = !!aim && aim.doneAt !== null;
+        const on = !aim || done || (det.onTarget && !det.missed);
 
-        // Where in the closing-in / shot cycle this target is, and its hits so far.
-        const done = age >= hitsNeeded * CYCLE_MS;
-        const cycle = done ? hitsNeeded : Math.floor(age / CYCLE_MS);
-        const sinceShot = done ? Infinity : age - cycle * CYCLE_MS - LOCK_MS;
-        const flashing = sinceShot >= 0 && sinceShot < SHOT_MS;
-        const hits = done ? hitsNeeded : cycle + (sinceShot >= 0 ? 1 : 0);
-
-        // Closing in: the ring shrinks from wide to a point on the target. It is
-        // hidden during a flash, except after the last hit, when the steady ring
-        // fades in and stays.
+        // Ring size: tight when on target, wider the further the aim is off.
         let r = steady;
-        let ringAlpha = 1;
-        if (sinceShot < 0) {
-          r = LOCK_START_RADIUS + (LOCK_END_RADIUS - LOCK_START_RADIUS) * (1 + sinceShot / LOCK_MS);
-        } else if (flashing) {
-          ringAlpha = hits >= hitsNeeded ? sinceShot / SHOT_MS : 0;
+        if (aim) {
+          let target = steady;
+          if (!on) {
+            const miss = Number.isFinite(det.aimError) && !det.missed ? AIM_OFF_MIN + AIM_GAIN * det.aimError : AIM_OFF_MAX;
+            target = steady + Math.min(AIM_OFF_MAX, miss);
+          }
+          aim.r = aim.r === null ? target : aim.r + (target - aim.r) * (1 - Math.exp(-aim.dt / RING_EASE_MS));
+          r = aim.r;
         }
 
-        if (ringAlpha > 0) {
-          ctx.globalAlpha = 0.55 * fadeAlpha * ringAlpha;
-          ctx.strokeStyle = '#000';
-          ctx.lineWidth = 4;
-          ctx.beginPath();
-          ctx.arc(cx, cy, r, 0, Math.PI * 2);
-          ctx.stroke();
+        ctx.globalAlpha = 0.55 * fadeAlpha;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = aim && on ? 5 : 4;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
 
-          ctx.globalAlpha = 0.95 * fadeAlpha * ringAlpha;
-          ctx.strokeStyle = colors.stroke;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(cx, cy, r, 0, Math.PI * 2);
-          ctx.stroke();
-        }
+        // Solid and bright = on target; dashed = off. The dash pattern carries
+        // the state on its own, without relying on colour.
+        ctx.globalAlpha = (on ? 1 : 0.8) * fadeAlpha;
+        ctx.strokeStyle = aim && on ? '#fff' : colors.stroke;
+        ctx.lineWidth = aim && on ? 3 : 2;
+        if (!on) ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
 
         ctx.globalAlpha = 0.95 * fadeAlpha;
         ctx.fillStyle = colors.stroke;
@@ -183,30 +195,31 @@ export class Renderer {
         ctx.arc(cx, cy, 2, 0, Math.PI * 2);
         ctx.fill();
 
-        // The shot: a bright core and a burst ring that expands and fades.
-        if (flashing) {
-          const p = sinceShot / SHOT_MS;
-          ctx.globalAlpha = (1 - p) * fadeAlpha;
-          ctx.fillStyle = '#fff';
-          ctx.beginPath();
-          ctx.arc(cx, cy, 2 + 5 * (1 - p), 0, Math.PI * 2);
-          ctx.fill();
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 3 * (1 - p) + 1;
-          ctx.beginPath();
-          ctx.arc(cx, cy, LOCK_END_RADIUS + (steady + 10 - LOCK_END_RADIUS) * p, 0, Math.PI * 2);
-          ctx.stroke();
-        }
+        if (aim) {
+          // Reaching 100%: a bright core and a burst ring that expands and fades.
+          const sinceDone = done ? now - aim.doneAt : Infinity;
+          if (sinceDone < FLASH_MS) {
+            const p = sinceDone / FLASH_MS;
+            ctx.globalAlpha = (1 - p) * fadeAlpha;
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(cx, cy, 2 + 5 * (1 - p), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 3 * (1 - p) + 1;
+            ctx.beginPath();
+            ctx.arc(cx, cy, steady + 14 * p, 0, Math.PI * 2);
+            ctx.stroke();
+          }
 
-        // Hits so far as a share of the hits needed.
-        if (tracked) {
-          const text = Math.round(100 * hits / hitsNeeded) + '%';
+          // Time on target as a share of the time needed.
+          const text = (done ? 100 : Math.min(99, Math.floor(100 * aim.onMs / dwellNeeded))) + '%';
           ctx.font = '600 11px system-ui, sans-serif';
           ctx.globalAlpha = 0.9 * fadeAlpha;
           ctx.lineWidth = 3;
           ctx.strokeStyle = '#000';
           ctx.strokeText(text, cx + steady + 4, cy - steady + 3);
-          ctx.fillStyle = hits >= hitsNeeded ? '#fff' : colors.stroke;
+          ctx.fillStyle = done ? '#fff' : colors.stroke;
           ctx.fillText(text, cx + steady + 4, cy - steady + 3);
         }
         ctx.globalAlpha = 1;

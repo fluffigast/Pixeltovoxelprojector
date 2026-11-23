@@ -3,7 +3,7 @@
 import { Detector } from './detector.js';
 import { MotionDetector } from './motion.js';
 import { Tracker } from './tracker.js';
-import { Renderer, setHitsNeeded } from './renderer.js';
+import { Renderer, setDwellNeeded } from './renderer.js';
 import { Network } from './network.js';
 import { PeerLink, newRoomCode, normalizeRoomCode } from './peer.js';
 import { Dashboard, countByClass } from './dashboard.js';
@@ -68,7 +68,7 @@ const confValue = $('confValue');
 const motionToggle = $('motionToggle');
 const motionSlider = $('motionSlider');
 const motionValue = $('motionValue');
-const hitsInput = $('hitsInput');
+const dwellInput = $('dwellInput');
 const dashboardEl = $('dashboard');
 const roomInput = $('roomInput');
 const joinBtn = $('joinBtn');
@@ -520,6 +520,7 @@ function render() {
       y: Math.round((d.y + oy) * sy),
       w: Math.round(d.w * sx),
       h: Math.round(d.h * sy),
+      aimError: d.aimError == null ? null : d.aimError * sx,
       trail,
     };
   }));
@@ -555,8 +556,8 @@ function shareFrame() {
   }
   shareCtx.drawImage(frameCanvas, 0, 0, w, h);
   const jpeg = shareCanvas.toDataURL('image/jpeg', SHARE_JPEG_QUALITY);
-  const detections = latestDetections.map(({ id, x, y, w: dw, h: dh, label, confidence, missed, trail }) => ({
-    id, x, y, w: dw, h: dh, label, confidence, missed,
+  const detections = latestDetections.map(({ id, x, y, w: dw, h: dh, label, confidence, missed, aimError, onTarget, trail }) => ({
+    id, x, y, w: dw, h: dh, label, confidence, missed, aimError, onTarget,
     trail: trail && trail.slice(-8).map(p => [Math.round(p[0]), Math.round(p[1])]),
   }));
   link.sendFrame(jpeg, detections, procW, procH);
@@ -981,10 +982,10 @@ function applyMotionSettings() {
   motionValue.textContent = v;
   motionDetector.setThreshold(v);
 }
-function applyHitsNeeded() {
-  setHitsNeeded(hitsInput.value);
+function applyDwellNeeded() {
+  setDwellNeeded(dwellInput.value);
 }
-hitsInput.addEventListener('input', applyHitsNeeded);
+dwellInput.addEventListener('input', applyDwellNeeded);
 
 motionToggle.addEventListener('change', applyMotionSettings);
 motionSlider.addEventListener('input', applyMotionSettings);
@@ -1030,7 +1031,7 @@ async function loadModel() {
 function init() {
   applyConfidence();
   applyMotionSettings();
-  applyHitsNeeded();
+  applyDwellNeeded();
   setupLinks();
 
   const invitedRoom = normalizeRoomCode(params.get('room'));

@@ -19,6 +19,8 @@ function cleanDetections(detections) {
       label: typeof d.label === 'string' ? d.label.slice(0, 20) : 'unknown',
       confidence: finite(d.confidence),
       missed: finite(d.missed),
+      aimError: Number.isFinite(d.aimError) ? d.aimError : null,
+      onTarget: d.onTarget === true,
       trail: Array.isArray(d.trail)
         ? d.trail.slice(-16).filter(p => Array.isArray(p)).map(p => [finite(p[0]), finite(p[1])]) : null,
     });
@@ -125,6 +127,7 @@ export class Dashboard {
     feed.renderer.draw(feed.detections.map(d => ({
       ...d,
       x: d.x * sx, y: d.y * sy, w: d.w * sx, h: d.h * sy,
+      aimError: d.aimError === null ? null : d.aimError * sx,
       trail: d.trail && d.trail.map(p => [p[0] * sx, p[1] * sy]),
     })));
   }

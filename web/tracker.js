@@ -30,7 +30,11 @@ export class Tracker {
 
   /**
    * @param {Array<{x,y,w,h,label,confidence,source}>} detections
-   * @returns {Array} one entry per confirmed live track: detection shape plus `id`, `missed`, `vx`, `vy`
+   * @returns {Array} one entry per confirmed live track: detection shape plus `id`, `missed`, `vx`, `vy`,
+   *   and how good the aim was this frame. The aim point is where the track was predicted to
+   *   be; `aimError` is its distance (px) from where the object was actually found, and
+   *   `onTarget` is true when the aim point lies inside the object's box. Both are null/false
+   *   for a frame in which the object was not found, and for a track's first frame.
    */
   update(detections, _shift = null, _masks = []) {   // extra args accepted for app.js compatibility
     const tracks = this.tracks;
@@ -57,6 +61,10 @@ export class Tracker {
       const det = detections[di];
       const t = tracks.get(id);
       const { cx, cy } = centres[di];
+      // Aim check, before the track is moved: predicted position vs where it really is.
+      const ex = cx - (t.cx + t.vx), ey = cy - (t.cy + t.vy);
+      t.aimError = Math.hypot(ex, ey);
+      t.onTarget = Math.abs(ex) <= Math.max(1, det.w / 2) && Math.abs(ey) <= Math.max(1, det.h / 2);
       const gap = t.missed + 1;                       // frames since last observation
       t.vx = (cx - t.cx) / gap;
       t.vy = (cy - t.cy) / gap;
@@ -84,6 +92,8 @@ export class Tracker {
     for (const [id, t] of tracks) {
       if (usedTracks.has(id)) continue;
       if (++t.missed > this.maxMissed) { tracks.delete(id); continue; }
+      t.aimError = null;                              // not found this frame: aim unknown
+      t.onTarget = false;
       t.cx += t.vx;
       t.cy += t.vy;
     }
@@ -99,6 +109,7 @@ export class Tracker {
         classified,
         confidence: det.confidence, source: det.source,
         missed: 0, hits: 1, age: 1,
+        aimError: null, onTarget: false,
         trail: [[centres[di].cx, centres[di].cy]],
       });
     }
@@ -116,6 +127,7 @@ export class Tracker {
         vx: t.vx, vy: t.vy,
         label: t.label, confidence: t.confidence, source: t.source,
         missed: t.missed,
+        aimError: t.aimError, onTarget: t.onTarget,
         trail: t.trail,
       });
     }

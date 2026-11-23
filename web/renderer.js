@@ -10,6 +10,28 @@ const CLASS_COLORS = {
 // CSS px. Smallest ring drawn around a detection: about a fingertip on a phone.
 const MIN_RING_RADIUS = 12;
 
+// Lock-on animation for the ring. For each target it repeats:
+//   the ring starts wide and closes in on the target (LOCK_MS), then a short
+//   flash marks a shot (SHOT_MS). Every shot counts as one hit.
+// A label shows hits / hits needed as a percentage. At 100% the cycle stops and
+// the normal steady ring stays on the target for as long as it is tracked.
+// Time only counts while the target is actually seen, not while it is coasting.
+// This is drawing only: nothing here knows whether a real shot was fired or landed.
+const LOCK_MS = 800;             // time the ring takes to close in
+const LOCK_START_RADIUS = 44;    // CSS px, ring size at the start of each cycle
+const LOCK_END_RADIUS = 3;       // CSS px, ring size at the moment of the shot
+const SHOT_MS = 220;             // length of the flash
+const CYCLE_MS = LOCK_MS + SHOT_MS;
+const LOCK_FORGET_MS = 500;      // a target gone for longer than this starts over at 0%
+const MAX_STEP_MS = 250;         // most time credited between two draws
+
+let hitsNeeded = 3;
+
+/** How many hits on one target count as 100% (1–50). Applies to every overlay. */
+export function setHitsNeeded(n) {
+  hitsNeeded = Math.min(50, Math.max(1, Math.round(Number(n)) || 1));
+}
+
 const STAT_IDS = [
   'fpsDisplay', 'countDisplay', 'insectCount', 'droneCount', 'birdCount',
   'inferDisplay', 'backendDisplay', 'motionMsDisplay', 'resolutionDisplay',
@@ -23,6 +45,21 @@ export class Renderer {
     this.height = 0;
     this._statEls = null;   // looked up on first use; overlay-only renderers never need them
     this._statText = {};
+    this._locks = new Map();   // detection id -> { active, seen } (ms), drives the lock-on animation
+  }
+
+  /** Milliseconds this detection has been seen so far (Infinity if it has no id). */
+  _lockAge(det, now) {
+    if (det.id === undefined || det.id === null) return Infinity;   // no identity: steady ring
+    let lock = this._locks.get(det.id);
+    if (!lock || now - lock.seen > LOCK_FORGET_MS) {   // new, or back after being gone
+      lock = { active: 0, seen: now };
+      this._locks.set(det.id, lock);
+    } else if (!det.missed) {
+      lock.active += Math.min(now - lock.seen, MAX_STEP_MS);
+    }
+    lock.seen = now;
+    return lock.active;
   }
 
   /** Size the overlay in CSS pixels; the backing store follows devicePixelRatio. */
@@ -40,8 +77,12 @@ export class Renderer {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  /** @param detections boxes in overlay CSS pixels */
-  draw(detections) {
+  /**
+   * @param detections boxes in overlay CSS pixels; an `id` that stays the same
+   *   from call to call lets the ring animate and count hits (see LOCK_MS)
+   * @param {number} [now] timestamp in ms, same clock on every call
+   */
+  draw(detections, now = performance.now()) {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.width, this.height);
 
@@ -76,25 +117,76 @@ export class Renderer {
       // Dark halo under the coloured ring so it reads on bright sky as well as
       // on dark foliage.
       if (area < 1600) {
-        const r = Math.max(MIN_RING_RADIUS, Math.max(w, h) / 2 + 5);
-        ctx.globalAlpha = 0.55 * fadeAlpha;
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.stroke();
+        const steady = Math.max(MIN_RING_RADIUS, Math.max(w, h) / 2 + 5);
+        const age = this._lockAge(det, now);
+        const tracked = age !== Infinity;
+
+        // Where in the closing-in / shot cycle this target is, and its hits so far.
+        const done = age >= hitsNeeded * CYCLE_MS;
+        const cycle = done ? hitsNeeded : Math.floor(age / CYCLE_MS);
+        const sinceShot = done ? Infinity : age - cycle * CYCLE_MS - LOCK_MS;
+        const flashing = sinceShot >= 0 && sinceShot < SHOT_MS;
+        const hits = done ? hitsNeeded : cycle + (sinceShot >= 0 ? 1 : 0);
+
+        // Closing in: the ring shrinks from wide to a point on the target. It is
+        // hidden during a flash, except after the last hit, when the steady ring
+        // fades in and stays.
+        let r = steady;
+        let ringAlpha = 1;
+        if (sinceShot < 0) {
+          r = LOCK_START_RADIUS + (LOCK_END_RADIUS - LOCK_START_RADIUS) * (1 + sinceShot / LOCK_MS);
+        } else if (flashing) {
+          ringAlpha = hits >= hitsNeeded ? sinceShot / SHOT_MS : 0;
+        }
+
+        if (ringAlpha > 0) {
+          ctx.globalAlpha = 0.55 * fadeAlpha * ringAlpha;
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.globalAlpha = 0.95 * fadeAlpha * ringAlpha;
+          ctx.strokeStyle = colors.stroke;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
 
         ctx.globalAlpha = 0.95 * fadeAlpha;
-        ctx.strokeStyle = colors.stroke;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.stroke();
-
         ctx.fillStyle = colors.stroke;
         ctx.beginPath();
         ctx.arc(cx, cy, 2, 0, Math.PI * 2);
         ctx.fill();
+
+        // The shot: a bright core and a burst ring that expands and fades.
+        if (flashing) {
+          const p = sinceShot / SHOT_MS;
+          ctx.globalAlpha = (1 - p) * fadeAlpha;
+          ctx.fillStyle = '#fff';
+          ctx.beginPath();
+          ctx.arc(cx, cy, 2 + 5 * (1 - p), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 3 * (1 - p) + 1;
+          ctx.beginPath();
+          ctx.arc(cx, cy, LOCK_END_RADIUS + (steady + 10 - LOCK_END_RADIUS) * p, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        // Hits so far as a share of the hits needed.
+        if (tracked) {
+          const text = Math.round(100 * hits / hitsNeeded) + '%';
+          ctx.font = '600 11px system-ui, sans-serif';
+          ctx.globalAlpha = 0.9 * fadeAlpha;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#000';
+          ctx.strokeText(text, cx + steady + 4, cy - steady + 3);
+          ctx.fillStyle = hits >= hitsNeeded ? '#fff' : colors.stroke;
+          ctx.fillText(text, cx + steady + 4, cy - steady + 3);
+        }
         ctx.globalAlpha = 1;
         continue;
       }
@@ -155,6 +247,11 @@ export class Renderer {
       }
       ctx.globalAlpha = 1;
     }
+
+    // Forget targets that are gone, so one that comes back is locked onto again.
+    for (const [id, lock] of this._locks) {
+      if (now - lock.seen > LOCK_FORGET_MS) this._locks.delete(id);
+    }
   }
 
   /** Update the sidebar. Only touches the DOM for values that changed. */
@@ -186,5 +283,6 @@ export class Renderer {
 
   clear() {
     this.ctx.clearRect(0, 0, this.width, this.height);
+    this._locks.clear();
   }
 }

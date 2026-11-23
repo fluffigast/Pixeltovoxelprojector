@@ -14,6 +14,7 @@ function cleanDetections(detections) {
   for (const d of Array.isArray(detections) ? detections.slice(0, 500) : []) {
     if (!d || typeof d !== 'object') continue;
     out.push({
+      id: Number.isFinite(d.id) ? d.id : undefined,
       x: finite(d.x), y: finite(d.y), w: finite(d.w), h: finite(d.h),
       label: typeof d.label === 'string' ? d.label.slice(0, 20) : 'unknown',
       confidence: finite(d.confidence),

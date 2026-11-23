@@ -118,6 +118,15 @@
     }
     .controls label { font-size: 0.75rem; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
     .controls input[type="file"] { display: none; }
+    .controls input[type="number"] {
+      inline-size: 4.5em;
+      background: var(--field-bg);
+      color: #eee;
+      border: 1px solid var(--field-border);
+      border-radius: 4px;
+      padding: 4px 6px;
+      font-size: 0.8125rem;
+    }
     .ctrl-group { display: flex; align-items: center; gap: 6px; }
     .controls output { min-inline-size: 2.5em; font-variant-numeric: tabular-nums; }
     input[type="checkbox"][switch] { margin: 0; cursor: pointer; }
@@ -465,11 +474,16 @@
           <input type="range" id="motionSlider" min="5" max="60" value="20" aria-describedby="hintThreshold">
           <output id="motionValue" for="motionSlider">20</output>
         </div>
+        <div class="ctrl-group">
+          <label for="hitsInput">Hits:</label>
+          <input type="number" id="hitsInput" min="1" max="50" value="3" inputmode="numeric" aria-describedby="hintHits">
+        </div>
         <button type="button" class="btn-sm" id="captureBtn" aria-describedby="hintCapture" aria-keyshortcuts="C">Capture</button>
       </div>
       <p class="control-hints">
         <span id="hintConf">Conf: minimum YOLO confidence.</span>
         <span id="hintThreshold">Threshold: brightness change that counts as motion, lower is more sensitive.</span>
+        <span id="hintHits">Hits: shots on one target that count as 100%. Shots are drawn only; the page does not fire anything.</span>
         <span id="hintCapture">Capture saves the frame with its overlay (key C).</span>
       </p>
 

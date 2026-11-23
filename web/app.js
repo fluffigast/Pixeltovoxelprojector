@@ -133,6 +133,7 @@ let frameCtx = null;
 let backendLabel = 'loading…';
 
 function resetPipeline() {
+  if (frameCanvas) startCaptureCheck();
   motionDetector.reset();
   tracker.reset();
   latestDetections = [];
@@ -221,6 +222,58 @@ async function setSource(source, file) {
 }
 
 // --- Frame capture ---
+// Some Android GPUs hand a hardware-decoded video to a CPU-readable canvas as
+// black or as the same picture over and over; the page then plays fine but
+// the detector sees nothing. CaptureCheck notices that from a few sampled
+// pixels and getFrame() falls back to the next way of reading the frame.
+const CAPTURE_MODES = [
+  { name: 'offscreen canvas', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true } },
+  { name: 'GPU canvas', make: (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }, opts: {} },
+  { name: 'VideoFrame', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, videoFrame: true },
+];
+const CHECK_FRAMES = 30;          // frames with advancing video time before judging
+let captureMode = 0;
+let captureCheck = null;          // { n, dark, still, prev: Uint8Array, lastTime } while judging; null when settled
+
+function startCaptureCheck() {
+  captureCheck = { n: 0, dark: 0, still: 0, prev: null, lastTime: -1 };
+}
+
+/** Sample 256 grey values on a grid and judge the capture after CHECK_FRAMES. */
+function checkCapture(frame) {
+  const c = captureCheck;
+  if (!c || video.currentTime === c.lastTime) return;
+  c.lastTime = video.currentTime;
+  const { data, width: w, height: h } = frame;
+  const cur = new Uint8Array(256);
+  let sum = 0, diff = 0;
+  for (let k = 0; k < 256; k++) {
+    const x = Math.floor(((k % 16) + 0.5) * w / 16), y = Math.floor(((k >> 4) + 0.5) * h / 16);
+    const i = (y * w + x) * 4;
+    const g = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+    cur[k] = g; sum += g;
+    if (c.prev) diff += Math.abs(g - c.prev[k]);
+  }
+  if (sum / 256 < 3) c.dark++;
+  if (c.prev && diff === 0) c.still++;
+  c.prev = cur;
+  if (++c.n < CHECK_FRAMES) return;
+  const mode = CAPTURE_MODES[captureMode].name;
+  const bad = c.dark > CHECK_FRAMES / 2 ? 'black' : c.still > CHECK_FRAMES / 2 ? 'frozen' : '';
+  captureCheck = null;
+  if (!bad) {
+    log('Frame check OK (' + mode + ', mean grey ' + Math.round(sum / 256) + ')');
+    return;
+  }
+  if (captureMode + 1 < CAPTURE_MODES.length) {
+    captureMode++;
+    log('Video frames read as ' + bad + ' via ' + mode + '; switching to ' + CAPTURE_MODES[captureMode].name);
+    frameCanvas = null;          // rebuilt by getFrame() with the new mode
+  } else {
+    log('Video frames read as ' + bad + ' with every capture method; this browser cannot analyse this video.');
+  }
+}
+
 function getFrame() {
   if (video.readyState < 2) return null;
   const vw = video.videoWidth;
@@ -232,16 +285,25 @@ function getFrame() {
   const scale = Math.min(1, MAX_PROCESS_SIDE / Math.max(vw, vh));
   const w = Math.round(vw * scale);
   const h = Math.round(vh * scale);
+  const mode = CAPTURE_MODES[captureMode];
   if (!frameCanvas || procW !== w || procH !== h) {
     procW = w;
     procH = h;
-    frameCanvas = createCanvas(w, h);
-    frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+    frameCanvas = mode.make(w, h);
+    frameCtx = frameCanvas.getContext('2d', mode.opts);
     resetPipeline();
     updateLayout();
+    startCaptureCheck();
   }
-  frameCtx.drawImage(video, 0, 0, w, h);
-  return frameCtx.getImageData(0, 0, w, h);
+  if (mode.videoFrame && typeof VideoFrame !== 'undefined') {
+    const vf = new VideoFrame(video);
+    try { frameCtx.drawImage(vf, 0, 0, w, h); } finally { vf.close(); }
+  } else {
+    frameCtx.drawImage(video, 0, 0, w, h);
+  }
+  const frame = frameCtx.getImageData(0, 0, w, h);
+  checkCapture(frame);
+  return frame;
 }
 
 // --- Detection merging ---

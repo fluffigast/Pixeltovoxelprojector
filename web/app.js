@@ -134,6 +134,7 @@ let backendLabel = 'loading…';
 
 function resetPipeline() {
   if (frameCanvas) startCaptureCheck();
+  analysedMediaTime = -1;
   motionDetector.reset();
   tracker.reset();
   latestDetections = [];
@@ -351,7 +352,8 @@ function checkCapture(frame) {
   } else {
     log('Video frames read as ' + bad + ' with every capture method; this browser cannot analyse this video. ' +
       'Open the page in Chrome, or try the Camera source.');
-    showStatus('This browser hands the video to the page as a ' + bad + ' picture. Open the page in Chrome, or try the Camera.');
+    showStatus((/Firefox\//.test(navigator.userAgent) ? 'Firefox' : 'This browser') +
+      ' hands the video to the page as a ' + bad + ' picture, so nothing can be detected. Open the page in Chrome, or try the Camera.');
   }
 }
 
@@ -481,19 +483,53 @@ function updateLayout() {
   renderer.resize(w, h);
 }
 
+// The marks belong to the frame that was analysed; by the time they are on
+// screen the video has moved on (analysis takes about a frame on a phone),
+// and a fly doing 10-25 px per frame would be marked where it was. So each
+// mark is drawn ahead along its track velocity by the video time elapsed
+// since its frame, in units of the time between analysed frames.
+const MAX_LEAD = 3;            // analysed-frame intervals; beyond that a prediction is a guess
+let analysedMediaTime = -1;    // video time of the frame latestDetections came from
+let mediaStep = 1 / 30;        // smoothed video time between analysed frames
+
+function noteAnalysedFrame(mediaTime) {
+  if (analysedMediaTime >= 0) {
+    const d = mediaTime - analysedMediaTime;
+    if (d > 0 && d < 0.5) mediaStep += (d - mediaStep) * 0.2;
+  }
+  analysedMediaTime = mediaTime;
+}
+
 function render() {
   if (!procW || !layout.w) return;
   const sx = layout.w / procW;
   const sy = layout.h / procH;
-  renderer.draw(latestDetections.map(d => ({
-    ...d,
-    x: Math.round(d.x * sx),
-    y: Math.round(d.y * sy),
-    w: Math.round(d.w * sx),
-    h: Math.round(d.h * sy),
-    trail: d.trail && d.trail.map(p => [p[0] * sx, p[1] * sy]),
-  })));
+  let lead = 0;
+  if (analysedMediaTime >= 0 && !video.paused) {
+    lead = (video.currentTime - analysedMediaTime) / mediaStep;
+    lead = lead > MAX_LEAD ? MAX_LEAD : lead > 0 ? lead : 0;
+  }
+  renderer.draw(latestDetections.map(d => {
+    const ox = (d.vx || 0) * lead, oy = (d.vy || 0) * lead;
+    const trail = d.trail && d.trail.map(p => [p[0] * sx, p[1] * sy]);
+    if (trail && (ox || oy)) trail.push([(d.x + d.w / 2 + ox) * sx, (d.y + d.h / 2 + oy) * sy]);
+    return {
+      ...d,
+      x: Math.round((d.x + ox) * sx),
+      y: Math.round((d.y + oy) * sy),
+      w: Math.round(d.w * sx),
+      h: Math.round(d.h * sy),
+      trail,
+    };
+  }));
 }
+
+// Redraw on every display frame so the predicted marks move smoothly between analysed frames.
+function renderLoop() {
+  if (!dashboardMode && !video.paused) render();
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
 
 // Resizing the window or the video element clears the canvas, so redraw.
 new ResizeObserver(() => { updateLayout(); render(); }).observe(video);
@@ -581,11 +617,12 @@ let lastMediaTime = -1;
 let lastProcessed = performance.now();
 let lastErrorLogged = '';
 
-function onFrame() {
+function onFrame(now, metadata) {
   try {
     if (useVideoFrameCallback || video.currentTime !== lastMediaTime) {
       lastMediaTime = video.currentTime;
       lastProcessed = performance.now();
+      noteAnalysedFrame(useVideoFrameCallback && metadata ? metadata.mediaTime : video.currentTime);
       processFrame();
     }
   } catch (e) {

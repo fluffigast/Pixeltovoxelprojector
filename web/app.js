@@ -230,7 +230,44 @@ const CAPTURE_MODES = [
   { name: 'offscreen canvas', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true } },
   { name: 'GPU canvas', make: (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }, opts: {} },
   { name: 'VideoFrame', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, videoFrame: true },
+  { name: 'WebGL', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, webgl: true },
 ];
+
+/** Reads video frames through a WebGL texture: a different GPU path than drawImage. */
+class GlGrabber {
+  constructor() {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl', { preserveDrawingBuffer: true, premultipliedAlpha: false, antialias: false });
+    if (!gl) throw new Error('WebGL unavailable');
+    const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, 'attribute vec2 p;varying vec2 t;void main(){t=vec2(p.x*.5+.5,.5-p.y*.5);gl_Position=vec4(p,0.,1.);}'));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, 'precision mediump float;varying vec2 t;uniform sampler2D s;void main(){gl_FragColor=texture2D(s,t);}'));
+    gl.linkProgram(prog);
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'p');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    this.c = c; this.gl = gl; this.buf = null;
+  }
+
+  /** Draws the current video frame into ctx (w x h). */
+  grab(src, ctx, w, h) {
+    const gl = this.gl, c = this.c;
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; this.buf = new ImageData(w, h); }
+    gl.viewport(0, 0, w, h);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // readPixels rows run bottom-up; the shader already flipped the picture, so they come out top-down.
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(this.buf.data.buffer));
+    ctx.putImageData(this.buf, 0, 0);
+  }
+}
+let glGrabber = null;
 const CHECK_FRAMES = 30;          // frames with advancing video time before judging
 let captureMode = 0;
 let captureCheck = null;          // { n, dark, still, prev: Uint8Array, lastTime } while judging; null when settled
@@ -319,11 +356,28 @@ function getFrame() {
     updateLayout();
     startCaptureCheck();
   }
-  if (mode.videoFrame && typeof VideoFrame !== 'undefined') {
-    const vf = new VideoFrame(video);
-    try { frameCtx.drawImage(vf, 0, 0, w, h); } finally { vf.close(); }
-  } else {
-    frameCtx.drawImage(video, 0, 0, w, h);
+  try {
+    if (mode.webgl) {
+      glGrabber ||= new GlGrabber();
+      glGrabber.grab(video, frameCtx, w, h);
+    } else if (mode.videoFrame) {
+      const vf = new VideoFrame(video);
+      try { frameCtx.drawImage(vf, 0, 0, w, h); } finally { vf.close(); }
+    } else {
+      frameCtx.drawImage(video, 0, 0, w, h);
+    }
+  } catch (e) {
+    // This way of reading frames does not work here at all: try the next one.
+    const failed = mode.name;
+    if (captureMode + 1 < CAPTURE_MODES.length) {
+      captureMode++;
+      frameCanvas = null;
+      log('Reading frames via ' + failed + ' failed (' + (e?.message || e) + '); switching to ' + CAPTURE_MODES[captureMode].name);
+    } else if (captureCheck) {
+      captureCheck = null;
+      log('Reading frames via ' + failed + ' failed (' + (e?.message || e) + '); no capture method left.');
+    }
+    return null;
   }
   const frame = frameCtx.getImageData(0, 0, w, h);
   checkCapture(frame);
@@ -904,6 +958,8 @@ function init() {
   scheduleFrame();
   setInterval(updateStats, STATS_INTERVAL_MS);
   loadModel();   // in the background: video and motion detection start right away
+  const brands = navigator.userAgentData?.brands?.filter(b => !/Not.?A.?Brand/i.test(b.brand)).map(b => b.brand + ' ' + b.version).join(', ');
+  log('Browser: ' + (brands || navigator.userAgent.replace(/^Mozilla\/5\.0 /, '')) + (navigator.userAgentData?.platform ? ' on ' + navigator.userAgentData.platform : ''));
 }
 
 init();

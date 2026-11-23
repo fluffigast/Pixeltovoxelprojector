@@ -231,7 +231,43 @@ const CAPTURE_MODES = [
   { name: 'GPU canvas', make: (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }, opts: {} },
   { name: 'VideoFrame', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, videoFrame: true },
   { name: 'WebGL', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, webgl: true },
+  // Firefox for Android reads a hardware-decoded file as black everywhere
+  // above, but frames of a MediaStream (the camera path) read fine; so play
+  // the file into a stream and read that.
+  { name: 'captured stream', make: (w, h) => createCanvas(w, h), opts: { willReadFrequently: true }, stream: true },
 ];
+
+let capVideo = null, capSource = '';
+const lastStreamSig = new Uint8Array(64);
+function sameAsLastStreamFrame(frame) {
+  const { data, width: w, height: h } = frame;
+  let same = true;
+  for (let k = 0; k < 64; k++) {
+    const i = (Math.floor(((k >> 3) + 0.5) * h / 8) * w + Math.floor(((k & 7) + 0.5) * w / 8)) * 4 + 1;
+    if (data[i] !== lastStreamSig[k]) { same = false; lastStreamSig[k] = data[i]; }
+  }
+  return same;
+}
+/** A hidden <video> showing video.captureStream(), rebuilt when the source changes. */
+function capturedVideo() {
+  // A new source (even the same file again) ends the old stream's tracks.
+  const src = sourceToken + ' ' + (video.currentSrc || 'stream');
+  const track = capVideo?.srcObject?.getVideoTracks?.()[0];
+  if (capVideo && capSource === src && track && track.readyState !== 'ended') return capVideo;
+  const grab = video.captureStream || video.mozCaptureStream;
+  if (!grab) throw new Error('captureStream unsupported');
+  if (!capVideo) {
+    // In the document (invisible) so the browser keeps decoding it at full rate.
+    capVideo = Object.assign(document.createElement('video'), { muted: true, playsInline: true });
+    capVideo.setAttribute('aria-hidden', 'true');
+    capVideo.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none';
+    document.body.appendChild(capVideo);
+  }
+  capVideo.srcObject = grab.call(video);
+  capVideo.play().catch(() => {});
+  capSource = src;
+  return capVideo;
+}
 
 /** Reads video frames through a WebGL texture: a different GPU path than drawImage. */
 class GlGrabber {
@@ -269,7 +305,7 @@ class GlGrabber {
 }
 let glGrabber = null;
 const CHECK_FRAMES = 30;          // frames with advancing video time before judging
-let captureMode = 0;
+let captureMode = Math.min(CAPTURE_MODES.length - 1, Math.max(0, parseInt(new URLSearchParams(location.search).get('capture'), 10) || 0));
 let captureCheck = null;          // { n, dark, still, prev: Uint8Array, lastTime } while judging; null when settled
 
 function startCaptureCheck() {
@@ -313,7 +349,9 @@ function checkCapture(frame) {
     log('Video frames read as ' + bad + ' via ' + mode + '; switching to ' + CAPTURE_MODES[captureMode].name);
     frameCanvas = null;          // rebuilt by getFrame() with the new mode
   } else {
-    log('Video frames read as ' + bad + ' with every capture method; this browser cannot analyse this video.');
+    log('Video frames read as ' + bad + ' with every capture method; this browser cannot analyse this video. ' +
+      'Open the page in Chrome, or try the Camera source.');
+    showStatus('This browser hands the video to the page as a ' + bad + ' picture. Open the page in Chrome, or try the Camera.');
   }
 }
 
@@ -357,7 +395,16 @@ function getFrame() {
     startCaptureCheck();
   }
   try {
-    if (mode.webgl) {
+    if (mode.stream) {
+      const cv = capturedVideo();
+      if (cv.readyState < 2) return null;
+      frameCtx.drawImage(cv, 0, 0, w, h);
+      // The stream updates on its own clock: a repeated picture is not a new frame.
+      const probe = frameCtx.getImageData(0, 0, w, h);
+      if (sameAsLastStreamFrame(probe)) return null;
+      checkCapture(probe);
+      return probe;
+    } else if (mode.webgl) {
       glGrabber ||= new GlGrabber();
       glGrabber.grab(video, frameCtx, w, h);
     } else if (mode.videoFrame) {

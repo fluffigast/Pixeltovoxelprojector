@@ -447,24 +447,46 @@ function processFrame() {
 // Process each decoded video frame exactly once. Driving this from
 // requestAnimationFrame alone would diff a frame against itself whenever the
 // display refreshes faster than the video, which reads as "no motion".
-const hasVideoFrameCallback = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+// requestVideoFrameCallback is preferred; some Android browsers never call it
+// back (or stop after a source change), so a watchdog falls back to
+// requestAnimationFrame plus a currentTime check when a playing video has
+// produced no analysed frame for a second.
+let useVideoFrameCallback = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 let lastMediaTime = -1;
+let lastProcessed = performance.now();
+let lastErrorLogged = '';
 
 function onFrame() {
   try {
-    if (hasVideoFrameCallback || video.currentTime !== lastMediaTime) {
+    if (useVideoFrameCallback || video.currentTime !== lastMediaTime) {
       lastMediaTime = video.currentTime;
+      lastProcessed = performance.now();
       processFrame();
     }
+  } catch (e) {
+    // Keep going, but say what broke: without this a failing frame loop only shows as "0 FPS".
+    const msg = String(e?.message || e);
+    if (msg !== lastErrorLogged) { lastErrorLogged = msg; log('Analysis error: ' + msg); console.error(e); }
   } finally {
     scheduleFrame();
   }
 }
 
 function scheduleFrame() {
-  if (hasVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  if (useVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
   else requestAnimationFrame(onFrame);
 }
+
+setInterval(() => {
+  const playing = !video.paused && !video.ended && video.readyState >= 2;
+  if (!useVideoFrameCallback || !playing || dashboardMode) { if (!playing) lastProcessed = performance.now(); return; }
+  if (performance.now() - lastProcessed > 1000) {
+    useVideoFrameCallback = false;
+    log('Video frame callbacks stopped; analysing on animation frames instead');
+    lastProcessed = performance.now();
+    requestAnimationFrame(onFrame);
+  }
+}, 500);
 
 // --- Stats ---
 let fps = null;

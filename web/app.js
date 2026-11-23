@@ -1028,7 +1028,36 @@ async function loadModel() {
   }
 }
 
+// --- Staying up to date ---
+// The host lets the browser reuse the page for ten minutes without asking, so a
+// visit shortly after a deploy can show the previous version. This page's
+// version is the stamp in its own URL (written by tools/stamp_web.mjs). If the
+// server already has another one, reload once to pick it up.
+const APP_VERSION = new URL(import.meta.url).searchParams.get('v');
+
+async function checkForUpdate() {
+  if (!APP_VERSION) return;   // unstamped copy (local development)
+  let latest = null;
+  try {
+    const res = await fetch(location.pathname, { cache: 'no-store' });
+    if (res.ok) latest = /<script type="module" src="app\.js\?v=([0-9a-f]+)">/.exec(await res.text())?.[1] ?? null;
+  } catch { /* offline: nothing to compare with */ }
+  if (!latest || latest === APP_VERSION) return;
+
+  const KEY = 'bugspotter-reloaded-for';
+  let tried = null;
+  try { tried = sessionStorage.getItem(KEY); } catch { /* storage unavailable */ }
+  if (tried === latest) {
+    // Already reloaded for this version and still got the old page.
+    log('A newer version of this page is published, but the browser keeps showing the old one. Reload without cache to update.');
+    return;
+  }
+  try { sessionStorage.setItem(KEY, latest); } catch { return; }   // no way to remember: do not risk a reload loop
+  location.reload();
+}
+
 function init() {
+  checkForUpdate();
   applyConfidence();
   applyMotionSettings();
   applyDwellNeeded();

@@ -265,12 +265,36 @@ function checkCapture(frame) {
     log('Frame check OK (' + mode + ', mean grey ' + Math.round(sum / 256) + ')');
     return;
   }
+  if (!canvasReadbackWorks()) {
+    log('This browser blocks pages from reading canvas pixels (privacy / anti-fingerprinting protection), so nothing can be analysed. ' +
+      'Allow fingerprinting or canvas access for this site in the browser settings (e.g. Brave Shields), or open the page in Chrome.');
+    showStatus('The browser blocks reading video pixels. See the activity log.');
+    return;
+  }
   if (captureMode + 1 < CAPTURE_MODES.length) {
     captureMode++;
     log('Video frames read as ' + bad + ' via ' + mode + '; switching to ' + CAPTURE_MODES[captureMode].name);
     frameCanvas = null;          // rebuilt by getFrame() with the new mode
   } else {
     log('Video frames read as ' + bad + ' with every capture method; this browser cannot analyse this video.');
+  }
+}
+
+/** Draw a known pattern and read it back: privacy protections return zeros or noise instead. */
+function canvasReadbackWorks() {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 4; c.height = 4;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = 'rgb(200, 100, 50)';
+    ctx.fillRect(0, 0, 4, 4);
+    const d = ctx.getImageData(0, 0, 4, 4).data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (Math.abs(d[i] - 200) > 3 || Math.abs(d[i + 1] - 100) > 3 || Math.abs(d[i + 2] - 50) > 3) return false;
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 

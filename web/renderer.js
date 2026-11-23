@@ -15,7 +15,9 @@ const MIN_RING_RADIUS = 12;
 //   flash marks a shot (SHOT_MS). Every shot counts as one hit.
 // A label shows hits / hits needed as a percentage. At 100% the cycle stops and
 // the normal steady ring stays on the target for as long as it is tracked.
-// Time only counts while the target is actually seen, not while it is coasting.
+// The tracker often loses a target for a moment and finds it again under a new
+// id (crawling insects, crowds). A new id that shows up where a target has just
+// vanished takes over that target's progress, so its hits are not lost.
 // This is drawing only: nothing here knows whether a real shot was fired or landed.
 const LOCK_MS = 800;             // time the ring takes to close in
 const LOCK_START_RADIUS = 44;    // CSS px, ring size at the start of each cycle
@@ -23,6 +25,7 @@ const LOCK_END_RADIUS = 3;       // CSS px, ring size at the moment of the shot
 const SHOT_MS = 220;             // length of the flash
 const CYCLE_MS = LOCK_MS + SHOT_MS;
 const LOCK_FORGET_MS = 500;      // a target gone for longer than this starts over at 0%
+const HANDOVER_RADIUS = 30;      // CSS px within which a new id continues a vanished target
 const MAX_STEP_MS = 250;         // most time credited between two draws
 
 let hitsNeeded = 3;
@@ -45,20 +48,38 @@ export class Renderer {
     this.height = 0;
     this._statEls = null;   // looked up on first use; overlay-only renderers never need them
     this._statText = {};
-    this._locks = new Map();   // detection id -> { active, seen } (ms), drives the lock-on animation
+    this._locks = new Map();   // detection id -> { active, seen (ms), x, y }, drives the lock-on animation
   }
 
-  /** Milliseconds this detection has been seen so far (Infinity if it has no id). */
-  _lockAge(det, now) {
+  /**
+   * Milliseconds this detection has been on screen so far (Infinity if it has no id).
+   * @param {Set} present ids drawn in this call; their progress is not up for takeover
+   */
+  _lockAge(det, cx, cy, now, present) {
     if (det.id === undefined || det.id === null) return Infinity;   // no identity: steady ring
     let lock = this._locks.get(det.id);
-    if (!lock || now - lock.seen > LOCK_FORGET_MS) {   // new, or back after being gone
-      lock = { active: 0, seen: now };
+    if (lock && now - lock.seen > LOCK_FORGET_MS) lock = null;       // back after being gone: start over
+    if (!lock) {
+      // New id. Continue the nearest target that has just vanished, if there is one.
+      let from = null;
+      let best = HANDOVER_RADIUS;
+      for (const [id, other] of this._locks) {
+        if (present.has(id) || now - other.seen > LOCK_FORGET_MS) continue;
+        const dist = Math.hypot(other.x - cx, other.y - cy);
+        if (dist <= best) { best = dist; from = id; }
+      }
+      if (from !== null) {
+        lock = this._locks.get(from);
+        this._locks.delete(from);
+      } else {
+        lock = { active: 0, seen: now, x: cx, y: cy };
+      }
       this._locks.set(det.id, lock);
-    } else if (!det.missed) {
-      lock.active += Math.min(now - lock.seen, MAX_STEP_MS);
     }
+    lock.active += Math.min(now - lock.seen, MAX_STEP_MS);
     lock.seen = now;
+    lock.x = cx;
+    lock.y = cy;
     return lock.active;
   }
 
@@ -87,6 +108,7 @@ export class Renderer {
     ctx.clearRect(0, 0, this.width, this.height);
 
     const sorted = detections.toSorted((a, b) => (a.w * a.h) - (b.w * b.h));
+    const present = new Set(detections.map(d => d.id));
 
     for (const det of sorted) {
       const colors = CLASS_COLORS[det.label] || CLASS_COLORS.unknown;
@@ -118,7 +140,7 @@ export class Renderer {
       // on dark foliage.
       if (area < 1600) {
         const steady = Math.max(MIN_RING_RADIUS, Math.max(w, h) / 2 + 5);
-        const age = this._lockAge(det, now);
+        const age = this._lockAge(det, cx, cy, now, present);
         const tracked = age !== Infinity;
 
         // Where in the closing-in / shot cycle this target is, and its hits so far.

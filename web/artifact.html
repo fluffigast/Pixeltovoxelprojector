@@ -28,7 +28,7 @@
   h1 { font-size: 1rem; margin: 0 0 12px; color: #7fff7f; letter-spacing: .5px; }
   h2 { font-size: 0.75rem; margin: 16px 0 6px; color: #7fff7f; text-transform: uppercase; letter-spacing: 1px; }
   label { display: block; margin: 6px 0 2px; font-size: 0.75rem; color: #a0d0a0; text-transform: uppercase; letter-spacing: .5px; }
-  input[type=text], select { width: 100%; box-sizing: border-box; background: #050a05; color: #d6ffd6; border: 1px solid #2a4a2a; padding: 6px 8px; font: inherit; border-radius: 3px; }
+  input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; background: #050a05; color: #d6ffd6; border: 1px solid #2a4a2a; padding: 6px 8px; font: inherit; border-radius: 3px; }
   input[type=range] { width: 100%; }
   input[type=file] { font: inherit; color: #a0d0a0; }
   button { background: #1f3a1f; color: #d6ffd6; border: 1px solid #2a4a2a; padding: 6px 10px; font: inherit; cursor: pointer; border-radius: 3px; }
@@ -104,6 +104,10 @@
     <label for="kz">Kill-zone (fraction of frame) <output id="kzv" for="kz">0.6</output></label>
     <input id="kz" type="range" min="0" max="100" value="60" />
     <label><input id="tgtStill" type="checkbox" /> Also target near-stationary tracks (landed/walking)</label>
+    <label><input id="fireOnTarget" type="checkbox" checked /> Fire only while the aim is on the target</label>
+    <label><input id="fireHold" type="checkbox" /> Keep firing while on target, up to max dwell (off: one frame per shot)</label>
+    <label for="expNeed">On-target time needed per target (ms)</label>
+    <input id="expNeed" type="number" min="50" max="60000" step="50" value="500" />
     <label for="dwell">Max dwell per shot (ms) <output id="dwellv" for="dwell">400</output></label>
     <input id="dwell" type="range" min="20" max="1000" value="400" />
     <div id="serStatus" class="status" role="status">Not connected.</div>
@@ -128,6 +132,8 @@
       <div><dt>Would-fire events</dt><dd id="s_cap">0</dd></div>
       <div><dt>Mean aim error</dt><dd id="s_err">—</dd></div>
       <div><dt>Hit rate (&lt;8 px)</dt><dd id="s_hits">—</dd></div>
+      <div><dt>On-target time, current target</dt><dd id="s_exp">—</dd></div>
+      <div><dt>Targets at 100%</dt><dd id="s_done">0</dd></div>
     </dl>
     <div class="row"><button type="button" id="auditExport">Export audit JSON</button></div>
 
@@ -262,12 +268,16 @@ async function setMode(mode) {
 let running = false;
 let frameN = 0, fpsFrames = 0, fpsT0 = performance.now();
 let lastWTime = 0;
+let lastStepT = 0;   // time of the previous analysed frame
+let doneCount = 0;   // targets that reached the on-target time needed
+let fireRunMs = 0;   // how long fire has been requested without a break
 
 function stopLoop() { running = false; }
 function startLoop() {
   if (running) return;
   running = true;
   frameN = 0; fpsFrames = 0; fpsT0 = performance.now();
+  lastStepT = 0; doneCount = 0; fireRunMs = 0;
   requestAnimationFrame(step);
 }
 
@@ -318,6 +328,7 @@ function step() {
     );
     const confirmed = trackerOut.moving;
     const stationary = trackerOut.stationary;
+    const expNeed = Math.max(50, +el('expNeed').value || 500);   // on-target ms that count as 100%
 
     // Draw background video, then overlays
     octx.drawImage(video, 0, 0, w, h);
@@ -376,7 +387,7 @@ function step() {
         octx.strokeStyle = '#7fff7f';
       }
       octx.fillStyle = '#7fff7f';
-      octx.fillText('#' + t.id + ' ' + bw + 'x' + bh, x, Math.max(10, y - 2));
+      octx.fillText('#' + t.id + ' ' + bw + 'x' + bh + (t.expMs ? ' ' + (t.done ? 100 : Math.min(99, Math.floor(100 * t.expMs / expNeed))) + '%' : ''), x, Math.max(10, y - 2));
       octx.fillStyle = 'rgba(127,255,127,.18)';
     }
 
@@ -394,6 +405,44 @@ function step() {
     el('s_stat').textContent = stationary.length;
     el('s_dets').textContent = confirmed.length;
 
+    // --- Aim check: was the last aim point on the target? ---
+    // Every track gets an aim point each frame (where the laser would be sent,
+    // lead included). The next time the target is found, its real position is
+    // known and that aim can be judged: on target = the aim point lies inside
+    // the target's box. Frames in which fire was requested count as time on
+    // target only if the aim is then judged on. The page cannot see the beam,
+    // so this is the aim that was commanded, not proof of a hit.
+    const frameMs = lastStepT ? Math.min(100, now - lastStepT) : 0;
+    lastStepT = now;
+    const fpsNow = +el('s_fps').textContent || 30;
+    const leadMs = +el('lead').value;
+    for (const t of confirmed.concat(stationary)) {
+      const seenNow = t.hits[t.hits.length - 1] === 1;
+      if (seenNow) {
+        if (t.aimPrev) {
+          const dx = t.last.cx - t.aimPrev.x, dy = t.last.cy - t.aimPrev.y;
+          t.aimErr = Math.hypot(dx, dy);
+          t.onTarget = Math.abs(dx) <= Math.max(2, t.last.w / 2) && Math.abs(dy) <= Math.max(2, t.last.h / 2);
+        } else {
+          t.aimErr = null;
+          t.onTarget = false;
+        }
+        if (t.pendMs && t.onTarget && !t.done) {
+          t.expMs = (t.expMs || 0) + t.pendMs;
+          if (t.expMs >= expNeed) { t.done = true; doneCount++; }
+        }
+        t.pendMs = 0;
+        t.unseen = 0;
+      } else if ((t.unseen = (t.unseen || 0) + 1) > 1) {
+        // Not found two steps running: the aim is unknown. (One step is let
+        // through: the display often refreshes faster than the video, and a
+        // repeated picture shows no motion.)
+        t.aimErr = null;
+        t.onTarget = false;
+      }
+      t.aimPrev = predictAim(t, leadMs, fpsNow);
+    }
+
     // --- Audit: resolve pending shots from previous frames (do this BEFORE summary) ---
     audit.resolve(frameN, confirmed);
     const au = audit.summary();
@@ -405,6 +454,7 @@ function step() {
     // Pick one target per frame, compute lead-predicted pixel, send to MCU.
     const fireMode = el('fireMode').value;
     // Fire gates: minAge, off cooldown, >=3 history points, recent diameter >= 4 px.
+    // A target that has had its on-target time is left alone.
     function diamOf(h, n) {
       const k = Math.min(n, h.length);
       let m2 = 0;
@@ -417,33 +467,62 @@ function step() {
       return Math.sqrt(m2);
     }
     const fireable = confirmed.filter(t =>
-      t.age >= 3 && (t.cooldown || 0) === 0 && t.history.length >= 3 && diamOf(t.history, 6) >= 4
+      !t.done && t.age >= 3 && (t.cooldown || 0) === 0 && t.history.length >= 3 && diamOf(t.history, 6) >= 4
     );
     if (el('tgtStill').checked) {
       for (const t of stationary) {
-        if (t.age >= 5 && (t.cooldown || 0) === 0) fireable.push(t);
+        if (!t.done && t.age >= 5 && (t.cooldown || 0) === 0) fireable.push(t);
       }
     }
     const target = pickTarget(fireable, w, h);
     if (target) {
-      const fpsNow = +el('s_fps').textContent || 30;
-      const aim = predictAim(target, +el('lead').value, fpsNow);
+      const aim = target.aimPrev;   // this frame's aim point, computed in the aim check above
       const inside = aim.x >= kz.x0 && aim.x <= kz.x1 && aim.y >= kz.y0 && aim.y <= kz.y1;
-      const fireBit = (fireMode === 'live' && inside && cal) ? 1 : 0;
-      // Record every would-fire moment regardless of fire mode (inside kill-zone).
-      if (inside) {
+      // Precise on/off: with "fire only while on target", fire is requested only
+      // if the previous aim at this target was judged on it. The turret keeps
+      // aiming either way. This gate can only withhold fire, never add it.
+      const onNow = target.onTarget;
+      let wouldFire = inside && (!el('fireOnTarget').checked || onNow);
+      const hold = el('fireHold').checked;
+      if (wouldFire && hold) {
+        // Holding fire: at most "max dwell" in one go. Then this target rests
+        // for the usual cooldown and this frame sends fire=0, which is also
+        // what rearms the MCU's own dwell cutoff.
+        fireRunMs += frameMs;
+        if (fireRunMs > +el('dwell').value) {
+          wouldFire = false;
+          fireRunMs = 0;
+          target.cooldown = 12;
+        }
+      } else {
+        fireRunMs = 0;
+      }
+      const fireBit = (fireMode === 'live' && wouldFire && cal) ? 1 : 0;
+      // Record every would-fire moment regardless of fire mode.
+      if (wouldFire) {
         audit.record(frameN, target.id, aim);
-        target.cooldown = 12; // ~400 ms per-track cooldown
+        target.pendMs = (target.pendMs || 0) + frameMs;   // judged when the target is next found
+        if (!hold) target.cooldown = 12; // ~400 ms per-track cooldown: one frame per shot
       }
 
-      // Draw aim reticle on overlay
+      // Draw aim reticle on overlay: tight and solid when the aim is on the
+      // target, dashed and wider the further the last aim was off.
+      const miss = onNow ? 0 : (target.aimErr === null ? 32 : Math.min(32, 6 + 2 * target.aimErr));
       octx.strokeStyle = fireBit ? '#ff4040' : '#ffdc50';
       octx.lineWidth = 2;
+      if (!onNow) octx.setLineDash([5, 4]);
       octx.beginPath();
-      octx.arc(aim.x, aim.y, 10, 0, Math.PI * 2);
+      octx.arc(aim.x, aim.y, 10 + miss, 0, Math.PI * 2);
+      octx.stroke();
+      octx.setLineDash([]);
+      octx.beginPath();
       octx.moveTo(aim.x - 14, aim.y); octx.lineTo(aim.x + 14, aim.y);
       octx.moveTo(aim.x, aim.y - 14); octx.lineTo(aim.x, aim.y + 14);
       octx.stroke();
+      const pct = Math.min(99, Math.floor(100 * (target.expMs || 0) / expNeed));
+      octx.fillStyle = octx.strokeStyle;
+      octx.fillText(pct + '%', aim.x + 14, aim.y - 14);
+      el('s_exp').textContent = Math.round(target.expMs || 0) + ' / ' + expNeed + ' ms (' + pct + '%)' + (fireMode === 'live' && cal ? '' : ' — not live, would-be');
 
       const sx = aim.x * srcW / w, sy = aim.y * srcH / h;
       const line = 'A ' + sx.toFixed(1) + ' ' + sy.toFixed(1) + ' ' + fireBit;
@@ -453,10 +532,13 @@ function step() {
       } else if (turret.connected()) {
         turret.sendLine(line);
       }
-    } else if (turret.connected()) {
+    } else {
+      fireRunMs = 0;
+      el('s_exp').textContent = '—';
       // No target -> explicit release so the MCU drops fire and rearms dwell.
-      turret.sendLine('A 0 0 0');
+      if (turret.connected()) turret.sendLine('A 0 0 0');
     }
+    el('s_done').textContent = doneCount;
   }
   requestAnimationFrame(step);
 }

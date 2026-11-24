@@ -107,6 +107,8 @@ export class MotionDetector {
     this._parent = grow(this._parent, Int32Array);
     this._area = grow(this._area, Int32Array);
     this._sum = grow(this._sum, Int32Array);      // residual sum per label (contrast)
+    this._sumX = grow(this._sumX, Float64Array);  // residual-weighted x and y sums (centroid)
+    this._sumY = grow(this._sumY, Float64Array);
     this._minX = grow(this._minX, Int32Array);
     this._maxX = grow(this._maxX, Int32Array);
     this._minY = grow(this._minY, Int32Array);
@@ -289,7 +291,7 @@ export class MotionDetector {
     const kc = this.clutterK;
     for (let c = 0; c < cellThr.length; c++) { const v = kc * clutter[c]; cellThr[c] = v > t ? v | 0 : t; }
     cellSum.fill(0); cellN.fill(0);
-    let parent = this._parent, area = this._area, sum = this._sum;
+    let parent = this._parent, area = this._area, sum = this._sum, sumX = this._sumX, sumY = this._sumY;
     let minX = this._minX, maxX = this._maxX, minY = this._minY, maxY = this._maxY;
     let next = 1, motionPixels = 0;
 
@@ -333,16 +335,19 @@ export class MotionDetector {
         } else {
           if (next === this._cap) {
             this._allocLabels(this._cap * 2);
-            parent = this._parent; area = this._area; sum = this._sum;
+            parent = this._parent; area = this._area; sum = this._sum; sumX = this._sumX; sumY = this._sumY;
             minX = this._minX; maxX = this._maxX; minY = this._minY; maxY = this._maxY;
           }
           lbl = next++;
-          parent[lbl] = lbl; area[lbl] = 0; sum[lbl] = 0;
+          parent[lbl] = lbl; area[lbl] = 0; sum[lbl] = 0; sumX[lbl] = 0; sumY[lbl] = 0;
           minX[lbl] = x; maxX[lbl] = x; minY[lbl] = y; maxY[lbl] = y;
         }
         labels[i] = lbl;
         area[lbl]++;
-        sum[lbl] += a < b ? a : b;
+        const res = a < b ? a : b;
+        sum[lbl] += res;
+        sumX[lbl] += res * x;
+        sumY[lbl] += res * y;
         if (x < minX[lbl]) minX[lbl] = x; else if (x > maxX[lbl]) maxX[lbl] = x;
         if (y > maxY[lbl]) maxY[lbl] = y;
       }
@@ -362,6 +367,8 @@ export class MotionDetector {
       if (r === l) continue;
       area[r] += area[l];
       sum[r] += sum[l];
+      sumX[r] += sumX[l];
+      sumY[r] += sumY[l];
       if (minX[l] < minX[r]) minX[r] = minX[l];
       if (maxX[l] > maxX[r]) maxX[r] = maxX[l];
       if (minY[l] < minY[r]) minY[r] = minY[l];
@@ -374,7 +381,7 @@ export class MotionDetector {
       if (parent[l] !== l) continue;
       const a = area[l];
       if (a < this.minArea) continue;
-      raw.push({ x: minX[l], y: minY[l], x1: maxX[l] + 1, y1: maxY[l] + 1, area: a, sum: sum[l] });
+      raw.push({ x: minX[l], y: minY[l], x1: maxX[l] + 1, y1: maxY[l] + 1, area: a, sum: sum[l], sumX: sumX[l], sumY: sumY[l] });
     }
     raw.sort((p, q) => q.area - p.area);
     if (raw.length > 400) raw.length = 400;
@@ -388,9 +395,9 @@ export class MotionDetector {
       if (target) {
         if (r.x < target.x) target.x = r.x; if (r.y < target.y) target.y = r.y;
         if (r.x1 > target.x1) target.x1 = r.x1; if (r.y1 > target.y1) target.y1 = r.y1;
-        target.area += r.area; target.sum += r.sum;
+        target.area += r.area; target.sum += r.sum; target.sumX += r.sumX; target.sumY += r.sumY;
       } else {
-        merged.push({ x: r.x, y: r.y, x1: r.x1, y1: r.y1, area: r.area, sum: r.sum });
+        merged.push({ x: r.x, y: r.y, x1: r.x1, y1: r.y1, area: r.area, sum: r.sum, sumX: r.sumX, sumY: r.sumY });
       }
     }
     // One more pass so chains of fragments that only became adjacent after a
@@ -404,7 +411,7 @@ export class MotionDetector {
         if (o.x < m.x1 + gap && m.x < o.x1 + gap && o.y < m.y1 + gap && m.y < o.y1 + gap) {
           if (o.x < m.x) m.x = o.x; if (o.y < m.y) m.y = o.y;
           if (o.x1 > m.x1) m.x1 = o.x1; if (o.y1 > m.y1) m.y1 = o.y1;
-          m.area += o.area; m.sum += o.sum; merged[j] = null;
+          m.area += o.area; m.sum += o.sum; m.sumX += o.sumX; m.sumY += o.sumY; merged[j] = null;
         }
       }
     }
@@ -426,7 +433,9 @@ export class MotionDetector {
       const cx = ((m.x + m.x1) >> 1) / CELL | 0, cy = ((m.y + m.y1) >> 1) / CELL | 0;
       cellHits[cy * cw + cx]++;
       cellNow[cy * cw + cx] = 1;
-      cand.push({ x: m.x, y: m.y, w: bw, h: bh, area: a, contrast, cell: cy * cw + cx });
+      // Centroid weighted by how much each pixel changed (+0.5: pixel centres).
+      cand.push({ x: m.x, y: m.y, w: bw, h: bh, area: a, contrast, cell: cy * cw + cx,
+        cx: m.sum ? m.sumX / m.sum + 0.5 : m.x + bw / 2, cy: m.sum ? m.sumY / m.sum + 0.5 : m.y + bh / 2 });
     }
 
     // Activity EMA: cells that produced a blob this frame move toward 1, others decay.
@@ -449,7 +458,7 @@ export class MotionDetector {
       const tex = this._bgTexture(prev2, off2, b);
       if (tex > this.bgTexMax && tex > b.contrast * this.bgTexRatio) continue;
       blobs.push({
-        x: b.x, y: b.y, w: b.w, h: b.h,
+        x: b.x, y: b.y, w: b.w, h: b.h, cx: b.cx, cy: b.cy,
         area: b.area, contrast: b.contrast, label: '', confidence: -1, source: 'motion',
       });
     }
